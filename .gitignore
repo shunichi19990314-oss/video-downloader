@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# シークレット (絶対にコミットしない)
+.env
+.env.*
+!.env.example
+cookies.txt
+*.cookies
+
+# ダウンロード生成物
+downloads/
+*.mp4
+*.mkv
+*.webm
+*.mp3
+*.m4a
+*.part
+*.zip
+
+# OS / エディタ
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.log

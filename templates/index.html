@@ -1,0 +1,828 @@
+<!DOCTYPE html>
+{# ==========================================================================
+   templates/index.html — 自分専用 動画ダウンローダ UI
+
+   * 外部 CDN / 外部フォントは一切使わず、CSS/JS すべてインラインで完結。
+   * API トークンは localStorage("vdl_token") に保存し、次回以降の入力を省略。
+   * 進捗は GET /api/status/{job_id} を 1 秒間隔でポーリング。
+   * 完了後は「ダウンロード」ボタンを表示。取得が済むとサーバ側で
+     ファイルは即座に自動削除される (Railway のエフェメラルストレージ対策)。
+   * Jinja2 から app_version / qualities / allow_playlist / file_ttl を受け取る。
+   ========================================================================== #}
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow, noarchive">
+  <title>Video Downloader</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⬇️</text></svg>">
+  <style>
+    /* ---------- デザイントークン ---------- */
+    :root{
+      --bg:#0b0f17;
+      --bg-soft:#111827;
+      --card:#151d2b;
+      --card-2:#1b2536;
+      --border:#26324a;
+      --text:#e7edf7;
+      --muted:#93a1b8;
+      --accent:#4f8cff;
+      --accent-2:#22d3ee;
+      --ok:#34d399;
+      --warn:#fbbf24;
+      --err:#f87171;
+      --radius:14px;
+      --shadow:0 10px 30px rgba(0,0,0,.35);
+      font-synthesis:none;
+    }
+    *{box-sizing:border-box}
+    html,body{height:100%}
+    body{
+      margin:0;
+      background:
+        radial-gradient(1200px 600px at 80% -10%, rgba(79,140,255,.18), transparent 60%),
+        radial-gradient(900px 500px at -10% 110%, rgba(34,211,238,.12), transparent 55%),
+        var(--bg);
+      color:var(--text);
+      font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Hiragino Kaku Gothic ProN",
+                  "Hiragino Sans","Noto Sans JP",Meiryo,"Helvetica Neue",Arial,sans-serif;
+      font-size:15px;line-height:1.6;
+      -webkit-font-smoothing:antialiased;
+    }
+    a{color:var(--accent)}
+    .wrap{max-width:860px;margin:0 auto;padding:28px 18px 72px}
+
+    /* ---------- ヘッダ ---------- */
+    header{display:flex;align-items:center;gap:14px;margin-bottom:22px}
+    .logo{
+      width:44px;height:44px;flex:0 0 44px;border-radius:12px;
+      background:linear-gradient(135deg,var(--accent),var(--accent-2));
+      display:grid;place-items:center;font-size:22px;box-shadow:var(--shadow);
+    }
+    h1{font-size:20px;margin:0;letter-spacing:.02em}
+    .sub{color:var(--muted);font-size:12.5px;margin:0}
+    .spacer{flex:1}
+    .pill{
+      font-size:11.5px;color:var(--muted);border:1px solid var(--border);
+      padding:3px 9px;border-radius:999px;background:rgba(255,255,255,.02);white-space:nowrap;
+    }
+
+    /* ---------- カード ---------- */
+    .card{
+      background:linear-gradient(180deg,var(--card),var(--card-2));
+      border:1px solid var(--border);border-radius:var(--radius);
+      padding:18px;margin-bottom:16px;box-shadow:var(--shadow);
+    }
+    .card h2{font-size:13px;text-transform:uppercase;letter-spacing:.12em;color:var(--muted);margin:0 0 12px}
+
+    /* ---------- フォーム ---------- */
+    label{display:block;font-size:12.5px;color:var(--muted);margin:0 0 6px}
+    input[type=text],input[type=password],input[type=url]{
+      width:100%;padding:11px 13px;border-radius:10px;
+      background:#0d1421;border:1px solid var(--border);color:var(--text);
+      font-size:14px;outline:none;transition:border-color .15s,box-shadow .15s;
+    }
+    input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(79,140,255,.18)}
+    input::placeholder{color:#5d6b83}
+    .row{display:flex;gap:10px;flex-wrap:wrap}
+    .row>*{flex:1;min-width:150px}
+    .field{margin-bottom:14px}
+    .hint{font-size:11.5px;color:var(--muted);margin-top:6px}
+    .token-row{display:flex;gap:8px;align-items:center}
+    .token-row input{flex:1}
+
+    /* ---------- ボタン ---------- */
+    button,.btn{
+      font:inherit;cursor:pointer;border-radius:10px;border:1px solid var(--border);
+      background:#1d2839;color:var(--text);padding:10px 15px;
+      transition:transform .06s,background .15s,border-color .15s,opacity .15s;
+      text-decoration:none;display:inline-flex;align-items:center;gap:7px;justify-content:center;
+    }
+    button:hover,.btn:hover{background:#243247;border-color:#33456a}
+    button:active,.btn:active{transform:translateY(1px)}
+    button:disabled{opacity:.45;cursor:not-allowed;transform:none}
+    .primary{
+      background:linear-gradient(135deg,var(--accent),#3b6fe0);
+      border-color:transparent;color:#fff;font-weight:600;width:100%;padding:13px 16px;
+    }
+    .primary:hover{filter:brightness(1.08);background:linear-gradient(135deg,var(--accent),#3b6fe0)}
+    .ghost{background:transparent}
+    .small{padding:7px 11px;font-size:12.5px;border-radius:9px}
+    .danger{border-color:#5b2b32;background:#2a1a1e;color:#ffc9c9}
+    .danger:hover{background:#3a2126}
+    .ok-btn{background:linear-gradient(135deg,#10b981,#059669);border-color:transparent;color:#fff;font-weight:600}
+
+    /* ---------- セグメント (品質選択) ---------- */
+    .seg{display:flex;gap:6px;flex-wrap:wrap}
+    .seg label{
+      margin:0;padding:8px 12px;border-radius:9px;border:1px solid var(--border);
+      background:#0d1421;color:var(--muted);cursor:pointer;font-size:12.5px;user-select:none;
+    }
+    .seg input{display:none}
+    .seg input:checked + span{color:#fff}
+    .seg label:has(input:checked){
+      border-color:var(--accent);background:rgba(79,140,255,.15);color:#fff;
+    }
+    .chk{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--muted);cursor:pointer}
+    .chk input{width:16px;height:16px;accent-color:var(--accent)}
+
+    /* ---------- 進捗 ---------- */
+    #progressCard{display:none}
+    .meta{display:flex;gap:14px;align-items:flex-start;margin-bottom:14px}
+    .thumb{
+      width:112px;height:63px;flex:0 0 112px;border-radius:8px;object-fit:cover;
+      background:#0d1421;border:1px solid var(--border);display:none;
+    }
+    .meta-body{min-width:0;flex:1}
+    .title{font-weight:600;font-size:14.5px;overflow-wrap:anywhere}
+    .channel{color:var(--muted);font-size:12.5px}
+    .bar-outer{
+      height:12px;border-radius:999px;background:#0d1421;border:1px solid var(--border);
+      overflow:hidden;position:relative;
+    }
+    .bar-inner{
+      height:100%;width:0%;border-radius:999px;
+      background:linear-gradient(90deg,var(--accent),var(--accent-2));
+      transition:width .35s ease;
+    }
+    .bar-inner.indeterminate{
+      width:35% !important;
+      animation:slide 1.2s ease-in-out infinite alternate;
+    }
+    @keyframes slide{from{margin-left:0}to{margin-left:65%}}
+    .bar-row{display:flex;justify-content:space-between;align-items:center;gap:10px;margin:9px 0 4px;font-size:12.5px}
+    .stage{color:var(--muted)}
+    .pct{font-variant-numeric:tabular-nums;font-weight:600}
+    .stats{display:flex;gap:14px;flex-wrap:wrap;color:var(--muted);font-size:12px;margin-top:2px}
+    .actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
+
+    .alert{border-radius:10px;padding:11px 13px;font-size:13px;margin-top:12px;white-space:pre-wrap;overflow-wrap:anywhere}
+    .alert.error{background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.35);color:#fecaca}
+    .alert.ok{background:rgba(52,211,153,.1);border:1px solid rgba(52,211,153,.32);color:#bbf7d8}
+    .alert.info{background:rgba(79,140,255,.09);border:1px solid rgba(79,140,255,.3);color:#cfe0ff}
+
+    /* ---------- 履歴 ---------- */
+    .job{display:flex;gap:10px;align-items:center;padding:9px 0;border-top:1px solid var(--border)}
+    .job:first-of-type{border-top:0}
+    .dot{width:9px;height:9px;border-radius:50%;flex:0 0 9px;background:var(--muted)}
+    .dot.downloading,.dot.queued{background:var(--warn);animation:pulse 1.1s infinite}
+    .dot.processing{background:var(--accent-2);animation:pulse 1.1s infinite}
+    .dot.finished{background:var(--ok)}
+    .dot.error{background:var(--err)}
+    @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+    .job-title{flex:1;min-width:0;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .job-pct{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums;min-width:46px;text-align:right}
+    .empty{color:var(--muted);font-size:13px;text-align:center;padding:14px 0}
+
+    /* ---------- トースト ---------- */
+    #toasts{position:fixed;top:16px;right:16px;display:flex;flex-direction:column;gap:8px;z-index:50;max-width:min(92vw,360px)}
+    .toast{
+      background:#182234;border:1px solid var(--border);border-left:3px solid var(--accent);
+      border-radius:10px;padding:10px 13px;font-size:13px;box-shadow:var(--shadow);
+      animation:in .18s ease-out;overflow-wrap:anywhere;
+    }
+    .toast.error{border-left-color:var(--err)}
+    .toast.ok{border-left-color:var(--ok)}
+    @keyframes in{from{opacity:0;transform:translateX(12px)}to{opacity:1;transform:none}}
+
+    footer{color:var(--muted);font-size:11.5px;text-align:center;margin-top:26px;line-height:1.9}
+    code{background:#0d1421;border:1px solid var(--border);border-radius:5px;padding:1px 5px;font-size:12px}
+    @media (max-width:560px){
+      .thumb{width:88px;height:50px;flex-basis:88px}
+      .row>*{min-width:100%}
+    }
+  </style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="logo">⬇️</div>
+    <div>
+      <h1>Personal Video Downloader</h1>
+      <p class="sub">yt-dlp + ffmpeg / Railway &middot; 自分専用の認証付きダウンローダ</p>
+    </div>
+    <div class="spacer"></div>
+    <span class="pill" id="healthPill" title="サーバ状態">接続確認中…</span>
+  </header>
+
+  <!-- ==================== 1. 認証 ==================== -->
+  <section class="card">
+    <h2>① API トークン</h2>
+    <div class="field">
+      <label for="token">AUTH_TOKEN <span style="opacity:.6">(このブラウザにのみ保存されます)</span></label>
+      <div class="token-row">
+        <input id="token" type="password" autocomplete="off" spellcheck="false"
+               placeholder="環境変数 AUTH_TOKEN に設定した値">
+        <button type="button" class="small ghost" id="toggleToken" title="表示/非表示">👁</button>
+        <button type="button" class="small" id="testToken">接続テスト</button>
+      </div>
+      <p class="hint">
+        トークンは <code>localStorage</code> に保存され、次回以降は入力が不要です。
+        共有 PC を使う場合は <label class="chk" style="display:inline-flex;vertical-align:middle">
+        <input type="checkbox" id="remember" checked> 保存する</label> を外してください。
+      </p>
+    </div>
+  </section>
+
+  <!-- ==================== 2. ダウンロード ==================== -->
+  <section class="card">
+    <h2>② 動画 URL</h2>
+    <div class="field">
+      <label for="url">URL</label>
+      <div class="token-row">
+        <input id="url" type="url" inputmode="url" autocomplete="off" spellcheck="false"
+               placeholder="https://www.youtube.com/watch?v=...">
+        <button type="button" class="small ghost" id="pasteBtn" title="クリップボードから貼り付け">📋 貼付</button>
+      </div>
+      <p class="hint">http / https のみ許可。localhost や内部 IP へのアクセスはブロックされます。</p>
+    </div>
+
+    <div class="field">
+      <label>画質 / 形式</label>
+      <div class="seg" id="qualitySeg">
+        {# サーバ側 QUALITY_PRESETS から選択肢をレンダリング #}
+        {% for q in qualities %}
+        <label>
+          <input type="radio" name="quality" value="{{ q.id }}" {% if loop.first %}checked{% endif %}>
+          <span>{{ q.label }}</span>
+        </label>
+        {% endfor %}
+      </div>
+    </div>
+
+    {% if allow_playlist %}
+    <div class="field">
+      <label class="chk">
+        <input type="checkbox" id="playlist">
+        再生リスト (プレイリスト) を丸ごと取得する — 完了時に ZIP でまとまります
+      </label>
+    </div>
+    {% endif %}
+
+    <button type="button" class="primary" id="startBtn">⬇ ダウンロード開始</button>
+    <div id="formAlert"></div>
+  </section>
+
+  <!-- ==================== 3. 進捗 ==================== -->
+  <section class="card" id="progressCard">
+    <h2>③ 進捗</h2>
+    <div class="meta">
+      <img class="thumb" id="thumb" alt="">
+      <div class="meta-body">
+        <div class="title" id="jobTitle">待機中…</div>
+        <div class="channel" id="jobChannel"></div>
+      </div>
+    </div>
+
+    <div class="bar-outer"><div class="bar-inner" id="bar"></div></div>
+    <div class="bar-row">
+      <span class="stage" id="stage">準備中</span>
+      <span class="pct" id="pct">0%</span>
+    </div>
+    <div class="stats">
+      <span id="statSpeed"></span>
+      <span id="statEta"></span>
+      <span id="statSize"></span>
+    </div>
+
+    <div class="actions" id="doneActions" style="display:none">
+      <a class="btn ok-btn" id="dlLink" href="#" download>⬇ ファイルを取得</a>
+      <button type="button" class="small" id="copyLink">🔗 リンクをコピー</button>
+      <button type="button" class="small danger" id="deleteJob">🗑 即削除</button>
+    </div>
+    <div id="jobAlert"></div>
+    <p class="hint" style="margin-top:12px">
+      ファイルは <strong>取得が完了した直後にサーバから自動削除</strong> されます
+      (未取得の場合は {{ file_ttl }} 秒後に削除)。再度必要になったらダウンロードをやり直してください。
+    </p>
+  </section>
+
+  <!-- ==================== 4. 履歴 ==================== -->
+  <section class="card">
+    <h2>④ 履歴 (このセッション)</h2>
+    <div id="history"><div class="empty">まだジョブがありません。</div></div>
+    <div class="actions">
+      <button type="button" class="small ghost" id="refreshHistory">↻ 更新</button>
+      <button type="button" class="small ghost" id="clearToken">🔑 トークンを消去</button>
+    </div>
+  </section>
+
+  <footer>
+    v{{ app_version }} &middot; API ドキュメント: <a href="/docs" target="_blank" rel="noopener">/docs</a>
+    &middot; ヘルスチェック: <a href="/api/health" target="_blank" rel="noopener">/api/health</a><br>
+    個人利用のみ。ダウンロードするコンテンツの著作権・利用規約は自己の責任で確認してください。
+  </footer>
+</div>
+
+<div id="toasts"></div>
+
+<script>
+"use strict";
+/* ==========================================================================
+   フロントエンド ロジック
+   ========================================================================== */
+
+const LS_TOKEN    = "vdl_token";
+const LS_QUALITY  = "vdl_quality";
+const LS_PLAYLIST = "vdl_playlist";
+const LS_REMEMBER = "vdl_remember";
+
+const POLL_INTERVAL_MS = 1000;   // 進捗ポーリング間隔
+const MAX_HISTORY_ROWS = 25;
+
+// ---- DOM ----
+const $ = (id) => document.getElementById(id);
+const el = {
+  token: $("token"), remember: $("remember"), toggleToken: $("toggleToken"), testToken: $("testToken"),
+  url: $("url"), pasteBtn: $("pasteBtn"), startBtn: $("startBtn"),
+  playlist: $("playlist"), qualitySeg: $("qualitySeg"),
+  formAlert: $("formAlert"), jobAlert: $("jobAlert"),
+  progressCard: $("progressCard"), bar: $("bar"), pct: $("pct"), stage: $("stage"),
+  jobTitle: $("jobTitle"), jobChannel: $("jobChannel"), thumb: $("thumb"),
+  statSpeed: $("statSpeed"), statEta: $("statEta"), statSize: $("statSize"),
+  doneActions: $("doneActions"), dlLink: $("dlLink"), copyLink: $("copyLink"), deleteJob: $("deleteJob"),
+  history: $("history"), refreshHistory: $("refreshHistory"), clearToken: $("clearToken"),
+  healthPill: $("healthPill"), toasts: $("toasts"),
+};
+
+// ---- 状態 ----
+let currentJobId = null;      // 現在追跡しているジョブ
+let pollTimer    = null;      // ポーリング用 setInterval
+const tracked    = new Map(); // jobId -> 最新スナップショット (履歴表示用)
+
+/* ==========================================================================
+   ユーティリティ
+   ========================================================================== */
+function getToken() { return (el.token.value || "").trim(); }
+
+function saveToken(value) {
+  try {
+    if (el.remember.checked && value) localStorage.setItem(LS_TOKEN, value);
+    else localStorage.removeItem(LS_TOKEN);
+    localStorage.setItem(LS_REMEMBER, el.remember.checked ? "1" : "0");
+  } catch (e) { /* プライベートモード等で localStorage が使えない場合は無視 */ }
+}
+
+function toast(message, kind = "info", ms = 4200) {
+  const node = document.createElement("div");
+  node.className = `toast ${kind}`;
+  node.textContent = message;
+  el.toasts.appendChild(node);
+  setTimeout(() => {
+    node.style.transition = "opacity .25s";
+    node.style.opacity = "0";
+    setTimeout(() => node.remove(), 260);
+  }, ms);
+}
+
+function alertBox(container, message, kind) {
+  if (!message) { container.innerHTML = ""; return; }
+  container.innerHTML = `<div class="alert ${kind}"></div>`;
+  container.firstChild.textContent = message; // XSS 防止: textContent で代入
+}
+
+function fmtBytes(bytes) {
+  if (!bytes && bytes !== 0) return "";
+  const units = ["B", "KB", "MB", "GB"];
+  let i = 0, n = bytes;
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+  return `${n.toFixed(n < 10 && i > 0 ? 1 : 0)} ${units[i]}`;
+}
+
+function fmtDuration(sec) {
+  if (!sec) return "";
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = Math.floor(sec % 60);
+  return h ? `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`
+           : `${m}:${String(s).padStart(2, "0")}`;
+}
+
+function selectedQuality() {
+  const checked = el.qualitySeg.querySelector("input[name=quality]:checked");
+  return checked ? checked.value : "best";
+}
+
+/** ダウンロード用 URL (ヘッダを付けられない <a href> 向けに token をクエリで付与) */
+function downloadUrl(jobId, withToken = true) {
+  const base = `/api/download/${encodeURIComponent(jobId)}`;
+  return withToken && getToken() ? `${base}?token=${encodeURIComponent(getToken())}` : base;
+}
+
+/* ==========================================================================
+   API クライアント
+   ========================================================================== */
+async function api(path, { method = "GET", body } = {}) {
+  const headers = { "Accept": "application/json" };
+  const token = getToken();
+  if (token) headers["X-API-Key"] = token;           // ★ 本来の認証経路
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+
+  let res;
+  try {
+    res = await fetch(path, {
+      method, headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+      cache: "no-store",
+    });
+  } catch (networkErr) {
+    throw new Error("サーバに接続できませんでした (ネットワークエラー / サービス停止中)。");
+  }
+
+  // 204 など本文なしレスポンスへの配慮
+  const text = await res.text();
+  let data = null;
+  if (text) { try { data = JSON.parse(text); } catch (_) { data = { detail: text }; } }
+
+  if (!res.ok) {
+    let msg = (data && (data.detail || data.message)) || `HTTP ${res.status}`;
+    if (typeof msg === "object") msg = JSON.stringify(msg); // バリデーションエラーの詳細
+    if (res.status === 401) msg = "API トークンが必要です。①で入力してください。";
+    if (res.status === 403) msg = "API トークンが正しくありません。①を確認してください。";
+    const err = new Error(msg);
+    err.status = res.status;
+    throw err;
+  }
+  return data;
+}
+
+/* ==========================================================================
+   進捗の描画
+   ========================================================================== */
+function renderJob(job) {
+  tracked.set(job.id, job);
+  const isCurrent = job.id === currentJobId;
+
+  // ---- メインタイトル / サムネイル ----
+  el.jobTitle.textContent   = job.title || (job.state === "queued" ? "キューで待機中…" : job.url);
+  const channelBits = [];
+  if (job.uploader) channelBits.push(job.uploader);
+  if (job.duration) channelBits.push(fmtDuration(job.duration));
+  if (job.extractor) channelBits.push(job.extractor);
+  if (job.is_playlist && job.entries_total) channelBits.push(`${job.entries_total} 件`);
+  el.jobChannel.textContent = channelBits.join(" / ");
+
+  if (job.thumbnail) {
+    // 外部サムネイルは読み込めない環境もあるため、失敗したら非表示にする
+    el.thumb.onerror = () => { el.thumb.style.display = "none"; };
+    if (el.thumb.src !== job.thumbnail) el.thumb.src = job.thumbnail;
+    el.thumb.style.display = "block";
+  } else {
+    el.thumb.style.display = "none";
+  }
+
+  // ---- 進捗バー ----
+  const pctNum = Number(job.percent || 0);
+  if (job.state === "processing" && pctNum >= 100) {
+    // ffmpeg 処理中は確定パーセントが出ないため不定バーにする
+    el.bar.classList.add("indeterminate");
+    el.pct.textContent = "—";
+  } else {
+    el.bar.classList.remove("indeterminate");
+    el.bar.style.width = `${Math.min(100, pctNum).toFixed(1)}%`;
+    el.pct.textContent = `${pctNum.toFixed(pctNum >= 10 ? 0 : 1)}%`;
+  }
+
+  el.stage.textContent = job.stage || "…";
+  el.statSpeed.textContent = job.speed ? `⚡ ${job.speed}` : "";
+  el.statEta.textContent   = job.eta   ? `⏱ 残り ${job.eta}` : "";
+  el.statSize.textContent  = job.filesize ? `💾 ${fmtBytes(job.filesize)}` : "";
+
+  // ---- 完了 / エラー ----
+  el.doneActions.style.display = "none";
+  if (job.state === "finished") {
+    el.bar.classList.remove("indeterminate");
+    el.bar.style.width = "100%";
+    el.pct.textContent = "100%";
+    el.doneActions.style.display = "flex";
+    el.dlLink.href = downloadUrl(job.id);
+    el.dlLink.setAttribute("download", job.filename || "");
+    el.dlLink.textContent = `⬇ ${job.filename || "ファイルを取得"}`;
+
+    const expires = job.expires_in;
+    alertBox(el.jobAlert,
+      `ダウンロード準備ができました。${job.filesize ? "サイズ: " + fmtBytes(job.filesize) + " / " : ""}` +
+      (expires != null ? `サーバ上の保持はあと約 ${expires} 秒です。` : ""),
+      "ok");
+
+    if (isCurrent && !job._notified) {
+      job._notified = true;
+      toast("✅ ダウンロード完了: " + (job.title || job.filename || ""), "ok");
+      stopPolling();
+    }
+  } else if (job.state === "error") {
+    alertBox(el.jobAlert, job.error || "不明なエラーが発生しました。", "error");
+    if (isCurrent && !job._notified) {
+      job._notified = true;
+      toast("❌ " + String(job.error || "エラー").split("\n")[0], "error", 7000);
+      stopPolling();
+      el.startBtn.disabled = false;
+      el.startBtn.textContent = "⬇ ダウンロード開始";
+    }
+  } else if (isCurrent) {
+    alertBox(el.jobAlert, "", "info");
+  }
+
+  renderHistory();
+}
+
+function renderHistory() {
+  const jobs = [...tracked.values()]
+    .sort((a, b) => (b.created_at || 0) - (a.created_at || 0))
+    .slice(0, MAX_HISTORY_ROWS);
+
+  if (!jobs.length) {
+    el.history.innerHTML = '<div class="empty">まだジョブがありません。</div>';
+    return;
+  }
+
+  el.history.innerHTML = "";
+  for (const job of jobs) {
+    const row = document.createElement("div");
+    row.className = "job";
+
+    const dot = document.createElement("span");
+    dot.className = `dot ${job.state}`;
+    dot.title = job.state;
+
+    const title = document.createElement("span");
+    title.className = "job-title";
+    title.textContent = job.title || job.url;
+    title.title = job.title || job.url;
+
+    const pct = document.createElement("span");
+    pct.className = "job-pct";
+    pct.textContent = job.state === "finished" ? "完了"
+                    : job.state === "error" ? "失敗"
+                    : `${Number(job.percent || 0).toFixed(0)}%`;
+
+    row.append(dot, title, pct);
+
+    // 完了ジョブには取得ボタン、それ以外には追跡ボタンを付ける
+    const act = document.createElement("button");
+    act.className = "small ghost";
+    if (job.state === "finished") {
+      act.textContent = "取得";
+      act.onclick = () => { window.location.href = downloadUrl(job.id); };
+    } else {
+      act.textContent = "表示";
+      act.onclick = () => {
+        currentJobId = job.id;
+        el.progressCard.style.display = "block";
+        if (job.state !== "error") startPolling(job.id);
+        renderJob(job);
+        el.progressCard.scrollIntoView({ behavior: "smooth", block: "center" });
+      };
+    }
+    row.appendChild(act);
+    el.history.appendChild(row);
+  }
+}
+
+/* ==========================================================================
+   ポーリング
+   ========================================================================== */
+function stopPolling() {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+}
+
+async function pollOnce(jobId) {
+  try {
+    const data = await api(`/api/status/${encodeURIComponent(jobId)}`);
+    if (data && data.job) renderJob(data.job);
+  } catch (err) {
+    if (err.status === 404) {
+      stopPolling();
+      alertBox(el.jobAlert, "ジョブが見つかりません (サーバ再起動により消失した可能性があります)。再度実行してください。", "error");
+    } else if (err.status === 401 || err.status === 403) {
+      stopPolling();
+      alertBox(el.jobAlert, err.message, "error");
+    }
+    // それ以外の一時エラー (ネットワーク瞬断など) はポーリングを継続
+  }
+}
+
+function startPolling(jobId) {
+  stopPolling();
+  pollOnce(jobId);
+  pollTimer = setInterval(() => pollOnce(jobId), POLL_INTERVAL_MS);
+}
+
+/* ==========================================================================
+   アクション
+   ========================================================================== */
+async function startDownload() {
+  const token = getToken();
+  if (!token) {
+    alertBox(el.formAlert, "先に ① の API トークンを入力してください。", "error");
+    el.token.focus();
+    return;
+  }
+  const url = el.url.value.trim();
+  if (!url) {
+    alertBox(el.formAlert, "動画 URL を入力してください。", "error");
+    el.url.focus();
+    return;
+  }
+  if (!/^https?:\/\//i.test(url)) {
+    alertBox(el.formAlert, "URL は http:// または https:// で始めてください。", "error");
+    return;
+  }
+
+  saveToken(token);
+
+  // UI を初期状態に
+  alertBox(el.formAlert, "", "info");
+  alertBox(el.jobAlert, "", "info");
+  el.progressCard.style.display = "block";
+  el.doneActions.style.display = "none";
+  el.bar.classList.remove("indeterminate");
+  el.bar.style.width = "0%";
+  el.pct.textContent = "0%";
+  el.stage.textContent = "ジョブを作成中…";
+  el.jobTitle.textContent = url;
+  el.jobChannel.textContent = "";
+  el.thumb.style.display = "none";
+  el.statSpeed.textContent = el.statEta.textContent = el.statSize.textContent = "";
+  el.startBtn.disabled = true;
+  el.startBtn.textContent = "⏳ 実行中…";
+  stopPolling();
+
+  try {
+    const payload = { url, quality: selectedQuality() };
+    if (el.playlist) payload.playlist = el.playlist.checked;
+    const data = await api("/api/download", { method: "POST", body: payload });
+    const job = data.job;
+    currentJobId = job.id;
+    renderJob(job);
+    startPolling(job.id);
+    try { localStorage.setItem(LS_QUALITY, payload.quality); } catch (_) {}
+    toast("ジョブを作成しました。バックグラウンドでダウンロード中です。", "info", 2600);
+  } catch (err) {
+    alertBox(el.formAlert, err.message, "error");
+    el.startBtn.disabled = false;
+    el.startBtn.textContent = "⬇ ダウンロード開始";
+  }
+}
+
+async function testConnection() {
+  if (!getToken()) { toast("トークンを入力してください。", "error"); el.token.focus(); return; }
+  saveToken(getToken());
+  try {
+    const cfg = await api("/api/presets");
+    toast(`✅ 認証OK (同時実行数 ${cfg.max_concurrent} / 保持 ${cfg.file_ttl_seconds}s)`, "ok");
+    el.healthPill.textContent = "認証 OK";
+    el.healthPill.style.color = "var(--ok)";
+  } catch (err) {
+    toast("❌ " + err.message, "error", 6000);
+    el.healthPill.textContent = "認証失敗";
+    el.healthPill.style.color = "var(--err)";
+  }
+}
+
+async function checkHealth() {
+  // 認証不要エンドポイントでサーバの生死を確認する
+  try {
+    const res = await fetch("/api/health", { cache: "no-store" });
+    const data = await res.json();
+    if (data.status === "ok") {
+      el.healthPill.textContent = data.ffmpeg ? `稼働中 / 空き ${Math.round(data.free_disk_mb)}MB` : "稼働中 (ffmpeg 未検出!)";
+      el.healthPill.style.color = data.ffmpeg ? "var(--ok)" : "var(--warn)";
+      if (!data.ffmpeg) toast("⚠ サーバに ffmpeg が見つかりません。マージ処理が失敗します。", "error", 8000);
+    }
+  } catch (_) {
+    el.healthPill.textContent = "オフライン";
+    el.healthPill.style.color = "var(--err)";
+  }
+}
+
+async function loadHistoryFromServer() {
+  if (!getToken()) return;
+  try {
+    const data = await api("/api/jobs?limit=25");
+    for (const job of (data.jobs || [])) {
+      // 既存の _notified フラグは維持する
+      const prev = tracked.get(job.id);
+      if (prev && prev._notified) job._notified = prev._notified;
+      tracked.set(job.id, job);
+    }
+    renderHistory();
+  } catch (_) { /* トークン未設定・401 は黙って無視 */ }
+}
+
+async function deleteCurrentJob() {
+  if (!currentJobId) return;
+  if (!confirm("サーバ上のファイルを今すぐ削除します。よろしいですか?")) return;
+  try {
+    await api(`/api/jobs/${encodeURIComponent(currentJobId)}`, { method: "DELETE" });
+    toast("🗑 サーバ上のファイルを削除しました。", "ok");
+    el.doneActions.style.display = "none";
+    alertBox(el.jobAlert, "ファイルを削除しました。", "info");
+    const j = tracked.get(currentJobId);
+    if (j) { j.filepath = null; }
+    loadHistoryFromServer();
+  } catch (err) {
+    toast("❌ " + err.message, "error");
+  }
+}
+
+async function copyDownloadLink() {
+  if (!currentJobId) return;
+  const link = `${location.origin}${downloadUrl(currentJobId)}`;
+  try {
+    await navigator.clipboard.writeText(link);
+    toast("🔗 ダウンロードリンクをコピーしました (トークンを含むため取り扱い注意)。", "ok");
+  } catch (_) {
+    // clipboard API が使えない環境向けフォールバック
+    window.prompt("リンクをコピーしてください:", link);
+  }
+}
+
+/* ==========================================================================
+   初期化 & イベントバインド
+   ========================================================================== */
+function initPrefs() {
+  // トークン
+  try {
+    const saved = localStorage.getItem(LS_TOKEN);
+    if (saved) el.token.value = saved;
+    const remember = localStorage.getItem(LS_REMEMBER);
+    if (remember !== null) el.remember.checked = remember === "1";
+    const quality = localStorage.getItem(LS_QUALITY);
+    if (quality) {
+      const radio = el.qualitySeg.querySelector(`input[value="${quality}"]`);
+      if (radio) radio.checked = true;
+    }
+    const playlist = localStorage.getItem(LS_PLAYLIST);
+    if (el.playlist && playlist !== null) el.playlist.checked = playlist === "1";
+  } catch (_) {}
+}
+
+function bindEvents() {
+  el.startBtn.addEventListener("click", startDownload);
+  el.testToken.addEventListener("click", testConnection);
+  el.copyLink.addEventListener("click", copyDownloadLink);
+  el.deleteJob.addEventListener("click", deleteCurrentJob);
+  el.refreshHistory.addEventListener("click", loadHistoryFromServer);
+
+  el.toggleToken.addEventListener("click", () => {
+    el.token.type = el.token.type === "password" ? "text" : "password";
+  });
+
+  el.token.addEventListener("change", () => saveToken(getToken()));
+  el.remember.addEventListener("change", () => saveToken(getToken()));
+
+  el.clearToken.addEventListener("click", () => {
+    try { localStorage.removeItem(LS_TOKEN); } catch (_) {}
+    el.token.value = "";
+    toast("トークンを消去しました。", "ok");
+  });
+
+  el.pasteBtn.addEventListener("click", async () => {
+    try {
+      el.url.value = (await navigator.clipboard.readText()).trim();
+      el.url.focus();
+    } catch (_) {
+      toast("クリップボードへのアクセスが拒否されました。手動で貼り付けてください。", "error");
+      el.url.focus();
+    }
+  });
+
+  // Enter で送信 (URL 入力欄)
+  el.url.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); startDownload(); }
+  });
+  el.token.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); el.url.focus(); }
+  });
+
+  // 品質・プレイリスト選択を記憶
+  el.qualitySeg.addEventListener("change", () => {
+    try { localStorage.setItem(LS_QUALITY, selectedQuality()); } catch (_) {}
+  });
+  if (el.playlist) {
+    el.playlist.addEventListener("change", () => {
+      try { localStorage.setItem(LS_PLAYLIST, el.playlist.checked ? "1" : "0"); } catch (_) {}
+    });
+  }
+
+  // ページを離れたらポーリングを止める (サーバ負荷低減)
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) stopPolling();
+    else if (currentJobId) {
+      const job = tracked.get(currentJobId);
+      if (!job || (job.state !== "finished" && job.state !== "error")) startPolling(currentJobId);
+    }
+  });
+  window.addEventListener("beforeunload", stopPolling);
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+  initPrefs();
+  bindEvents();
+  checkHealth();
+  loadHistoryFromServer();
+  setInterval(checkHealth, 30000);
+});
+</script>
+</body>
+</html>
