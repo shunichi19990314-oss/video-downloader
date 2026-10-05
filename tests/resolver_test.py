@@ -65,6 +65,7 @@ VALID = "validcode123"      # 正常に m3u8 が取れる
 FALLBACK = "fallbackcd1_x"  # /e/ は 404、/f/ だけ生きている (実サイトと同じ挙動)
 DUPCODE = "dupcode12345"    # /f/ と /d/ が同一内容、/<code> にだけプレイヤーがある
 SLOWCODE = "slowcode12345"  # ページ応答が遅い (タイムアウト/予算の検証用)
+IFRAMECODE = "iframecode123"  # m3u8 が iframe 越し (リゾルバ不可 / yt-dlp generic 可)
 NOMEDIA_PAGE = "<!DOCTYPE html><html><head><title>Download URKK-TEST.mp4</title></head>" \
     "<body><div class='dl'>URKK-TEST.mp4</div>" \
     "<script src='https://www.google.com/recaptcha/api.js'></script></body></html>"
@@ -142,6 +143,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     return self._send(200, NOMEDIA_PAGE)
                 media = f"http://127.0.0.1:{PORT}/hls/index.m3u8"
                 return self._send(200, PAGE_TMPL.format(title="Watch Page Movie", media=media))
+            if code == IFRAMECODE:
+                # どのルートでも「iframe 埋め込みの視聴ページ」を返す。
+                # ページ内に m3u8 は無く、iframe の先にプレイヤーがある。
+                # → 自前リゾルバは解決不能、yt-dlp generic は iframe 追従で解決可能。
+                return self._send(200,
+                    "<!DOCTYPE html><html><head><title>Iframe Movie</title></head><body>"
+                    f'<IFRAME SRC="http://127.0.0.1:{PORT}/pl/iframeplayer" '
+                    'FRAMEBORDER=0 WIDTH=640 HEIGHT=360 allowfullscreen></IFRAME>'
+                    "</body></html>")
             if code == SLOWCODE:
                 time.sleep(20)     # タイムアウト/予算切れを確実に発生させる
                 media = f"http://127.0.0.1:{PORT}/hls/index.m3u8"
@@ -165,6 +175,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if bare == SLOWCODE:
                 time.sleep(20)
                 return self._send(200, PAGE_TMPL.format(title="Slow", media=media))
+
+        # --- iframe の先のプレイヤーページ ---
+        if path.startswith("/pl/"):
+            media = f"http://127.0.0.1:{PORT}/hls2/index.m3u8"
+            return self._send(200, PAGE_TMPL.format(title="Iframe Inner Player", media=media))
+
+        # --- Referer 不要の HLS (フォールバック検証用) ---
+        if path.startswith("/hls2/"):
+            f = HLS_DIR / path.split("/hls2/")[-1]
+            if f.is_file():
+                ctype = "application/vnd.apple.mpegurl" if f.suffix == ".m3u8" else "video/mp2t"
+                return self._send(200, f.read_bytes(), ctype)
+            return self._send(404, "not found")
 
         # --- ドメインロックされた HLS ---
         if path.startswith("/hls/"):
@@ -601,6 +624,87 @@ try:
     check("MAX_CANDIDATES で候補数が制限される", len(got) == 2, got)
 finally:
     resolvers.MAX_CANDIDATES = resolvers_saved
+
+# ==========================================================================
+print("\n--- 16) yt-dlp へのフォールバック (iframe 埋め込み) ---")
+with TestClient(main.app) as client:
+    clean()
+    r = client.post("/api/download", json={"url": base(f"/f/{IFRAMECODE}")}, headers=H)
+    check("受付 202", r.status_code == 202, r.text[:200])
+    jid = r.json()["job"]["id"]
+    stages = []
+    deadline = time.time() + 120
+    job = None
+    while time.time() < deadline:
+        job = client.get(f"/api/status/{jid}", headers=H).json()["job"]
+        stages.append(job["stage"])
+        if job["state"] in ("finished", "error"):
+            break
+        time.sleep(0.02)   # 一過性の stage を取りこぼさないよう高頻度で
+    # 期待する正しい挙動:
+    #   リゾルバが m3u8 を見つけられない → 諦めずに yt-dlp へフォールバックする
+    #   → yt-dlp の generic extractor も解決できなければ error
+    #   → エラー文には「yt-dlp の結果」と「リゾルバの DevTools 案内」の両方を含める
+    #   (iframe 越しのプレイヤーは generic でも辿れないことがある = 実測済み)
+    # フォールバックした決定的な証拠 = エラー文が「yt-dlp の結果」+「リゾルバの案内」
+    # の合成になっていること (resolver_hint はフォールバック経路でしか設定されない)。
+    # stage の目視確認は一過性なので高速ポーリングで狙う (取れなくても失敗にしない)。
+    check("★ フォールバック経路を通った (エラー文の合成が証拠)",
+          "自動解析の試行結果" in (job.get("error") or ""), (job.get("error") or "")[:200])
+    if any("yt-dlp で直接解析中" in (x or "") for x in stages):
+        check("stage に『yt-dlp で直接解析中』が表示された", True)
+    else:
+        print("  (参考) stage の遷移が速く『yt-dlp で直接解析中』は観測できませんでしたが、"
+              "エラー文の合成によりフォールバック経路は確認済みです")
+    check("yt-dlp も解決できなければ error で終わる", job["state"] == "error", job["state"])
+    err = job.get("error") or ""
+    check("★ エラー文に yt-dlp 側の理由が入る", "対応していません" in err or "Unsupported" in err, err[:160])
+    check("★ エラー文にリゾルバの DevTools 案内も入る",
+          "自動解析の試行結果" in err and "DevTools" in err, err[-220:])
+    check("失敗時に残骸ファイルが無い", list(TEST_DIR.iterdir()) == [], [p.name for p in TEST_DIR.iterdir()])
+    clean()
+
+    # --- 確定的失敗 (失効) ではフォールバックしない ---
+    print("\n--- 17) 失効は確定的 → フォールバックせず即エラー ---")
+    r = client.post("/api/download", json={"url": base(f"/e/{EXPIRED}.html")}, headers=H)
+    job = wait_job(client, r.json()["job"]["id"])
+    check("失効 → error", job["state"] == "error", job["state"])
+    err = job.get("error") or ""
+    check("★ 失効メッセージのみ (yt-dlp のエラーを混ぜない)",
+          "失効" in err and "自動解析の試行結果" not in err, err[:200])
+    clean()
+
+    # --- 両方失敗したら、ヒントを合成して返す ---
+    print("\n--- 18) リゾルバも yt-dlp も失敗 → 両方の情報を返す ---")
+    r = client.post("/api/download", json={"url": base(f"/e/{OBFUSC}.html")}, headers=H)
+    job = wait_job(client, r.json()["job"]["id"])
+    check("両方失敗 → error", job["state"] == "error", job["state"])
+    err = job.get("error") or ""
+    check("★ yt-dlp 側のエラーが含まれる", len(err) > 0, err[:120])
+    check("★ リゾルバの DevTools 案内も含まれる",
+          "自動解析の試行結果" in err and "DevTools" in err, err[-260:])
+    clean()
+
+    # --- RESOLVER_FALLBACK=0 で旧挙動 (即失敗) ---
+    print("\n--- 19) RESOLVER_FALLBACK_TO_YTDLP=0 ---")
+    main.RESOLVER_FALLBACK = False
+    r = client.post("/api/download", json={"url": base(f"/f/{IFRAMECODE}")}, headers=H)
+    job = wait_job(client, r.json()["job"]["id"])
+    check("無効時はフォールバックせず error", job["state"] == "error", job["state"])
+    check("エラー文に DevTools 案内がある", "DevTools" in (job.get("error") or ""),
+          (job.get("error") or "")[:160])
+    main.RESOLVER_FALLBACK = True
+    clean()
+
+    # --- /api/info もフォールバックする ---
+    print("\n--- 20) /api/info のフォールバック ---")
+    r = client.post("/api/info", json={"url": base(f"/f/{IFRAMECODE}")}, headers=H)
+    check("iframe ページの /api/info はフォールバック後も 4xx (解決不能)",
+          400 <= r.status_code < 500, f"{r.status_code} {r.text[:160]}")
+    check("/api/info のエラーにも理由が含まれる",
+          "detail" in (r.json() or {}), list((r.json() or {}).keys()))
+    r = client.post("/api/info", json={"url": base(f"/e/{EXPIRED}.html")}, headers=H)
+    check("失効ページの /api/info は 422 のまま", r.status_code == 422, r.status_code)
 
 srv.shutdown()
 

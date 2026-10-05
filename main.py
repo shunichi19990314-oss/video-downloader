@@ -51,6 +51,8 @@
     RESOLVER_TIMEOUT      リゾルバの1ページ取得タイムアウト秒  (default: 12)
     RESOLVER_TOTAL_BUDGET リゾルバ全体の時間予算(秒)          (default: 45)
     RESOLVER_MAX_CANDIDATES 試す候補URL数の上限               (default: 6)
+    RESOLVER_FALLBACK_TO_YTDLP
+                          リゾルバ失敗時に yt-dlp へ任せるか   (default: 1)
 
 ■ リクエスト単位のパラメータ (環境変数ではない)
     POST /api/download と POST /api/info は以下を受け付けます。
@@ -181,6 +183,11 @@ COOKIES_FILE: str = _env_str("COOKIES_FILE", "").strip()
 # HLS ホストを .m3u8 へ解決する) を有効にするか。 1=有効(既定) / 0=無効
 ENABLE_SITE_RESOLVERS: bool = _env_flag("ENABLE_SITE_RESOLVERS", True)
 
+# リゾルバが解決できなかったとき、URL をそのまま yt-dlp に渡して再挑戦するか。
+# yt-dlp の generic extractor は iframe 追従など自前リゾルバより高性能なため、
+# リゾルバの失敗を「ジョブの失敗」にすべきではない。 1=有効(既定) / 0=無効
+RESOLVER_FALLBACK: bool = _env_flag("RESOLVER_FALLBACK_TO_YTDLP", True)
+
 # リゾルバの対象に追加するホスト名 (カンマ区切り)。
 # StreamHG 系はミラードメインが多いため、コード変更せずに追加できるようにする。
 #   例) RESOLVER_EXTRA_HOSTS=streamhg.net,myhost.example
@@ -194,7 +201,7 @@ if RESOLVER_EXTRA_HOSTS:
         resolvers.STREAMHG_HOSTS.add(f"www.{_h}")
 
 APP_START_TIME: float = time.time()
-APP_VERSION: str = "1.2.2"
+APP_VERSION: str = "1.3.0"
 
 
 # ===========================================================================
@@ -969,8 +976,9 @@ def _resolve_target(job: Job) -> Tuple[str, Optional[str]]:
             # 解析中の表示を UI へ流す (state は変えず stage だけ更新)
             on_progress=lambda msg: job.set_stage(msg),
         )
-    except (ResolveError, ValidationError) as exc:
+    except ValidationError as exc:
         raise ExtractionError(str(exc)) from exc
+    # ResolveError はそのまま呼び出し元へ伝える (definitive フラグを判定するため)
 
     if resolved is None:
         return job.url, None      # 対応外サイト → URL をそのまま yt-dlp へ
@@ -1003,8 +1011,24 @@ def _run_download(job: Job) -> None:
     # フェーズ1: URL 解決 (セマフォの外 / ネットワーク待ちで時間がかかるため)
     # ------------------------------------------------------------------
     job.set_stage("URL を解析中…")
+    resolver_hint: Optional[str] = None   # 両方失敗したときのエラー文に添える
     try:
         target_url, resolver_title = _resolve_target(job)
+    except ResolveError as exc:
+        if RESOLVER_FALLBACK and not exc.definitive:
+            # ★ リゾルバが見つけられなくても、yt-dlp の generic extractor なら
+            #   iframe 追従などで解決できる可能性がある。ここで諦めない。
+            resolver_hint = str(exc)
+            log.info("[job=%s] リゾルバ未解決 → yt-dlp へフォールバック: %s",
+                     job.id, str(exc).splitlines()[0][:120])
+            job.set_stage("リゾルバで解決できず、yt-dlp で直接解析中…")
+            target_url, resolver_title = job.url, None
+        else:
+            # definitive=True (ファイル失効など) は確定的な答えなので即失敗
+            job.fail(str(exc))
+            log.warning("[job=%s] URL 解決に失敗 (確定的): %s", job.id, str(exc)[:200])
+            _cleanup_partial(job.id)
+            return
     except ExtractionError as exc:
         job.fail(str(exc))
         log.warning("[job=%s] URL 解決に失敗: %s", job.id, str(exc)[:200])
@@ -1107,10 +1131,10 @@ def _run_download(job: Job) -> None:
 
         except yt_dlp.utils.DownloadError as exc:
             # 存在しないURL / 非公開 / 年齢制限 / 地域制限 / ネットワークエラー など
-            job.fail(_friendly_error(str(exc)))
+            job.fail(_combine_errors(_friendly_error(str(exc)), resolver_hint))
             log.warning("[job=%s] DownloadError: %s", job.id, exc)
         except yt_dlp.utils.ExtractorError as exc:
-            job.fail(_friendly_error(str(exc)))
+            job.fail(_combine_errors(_friendly_error(str(exc)), resolver_hint))
             log.warning("[job=%s] ExtractorError: %s", job.id, exc)
         except ValidationError as exc:
             job.fail(str(exc))
@@ -1123,6 +1147,22 @@ def _run_download(job: Job) -> None:
             # 失敗時は残骸 (.part など) を掃除する
             if job.state == JobState.ERROR:
                 _cleanup_partial(job.id)
+
+
+def _combine_errors(primary: str, hint: Optional[str]) -> str:
+    """
+    yt-dlp のエラーに、リゾルバ側のヒントを添えて返す。
+
+    リゾルバも yt-dlp も失敗した場合、ユーザーには「どちらの情報も」必要。
+    特に DevTools で m3u8 を取る手順は、この組み合わせでしか案内できない。
+    """
+    if not hint:
+        return primary
+    return (
+        f"{primary}\n\n"
+        "―――― 自動解析の試行結果 ――――\n"
+        f"{hint}"
+    )
 
 
 def _cleanup_partial(job_id: str) -> None:
@@ -1653,11 +1693,17 @@ async def probe_info(
         try:
             resolved = resolvers.resolve_if_supported(
                 url, user_agent=user_agent, validate_url=validate_url)
-        except (ResolveError, ValidationError) as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        if resolved is not None:
-            probe_url = resolved.media_url
-            probe_referer = probe_referer or resolved.referer
+            if resolved is not None:
+                probe_url = resolved.media_url
+                probe_referer = probe_referer or resolved.referer
+        except ValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except ResolveError as exc:
+            # 確定的な失敗 (失効など) だけを 422 で返し、
+            # それ以外は yt-dlp の generic extractor に任せて続行する
+            if exc.definitive or not RESOLVER_FALLBACK:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            log.info("/api/info: リゾルバ未解決 → yt-dlp へフォールバック (%s)", url[:90])
 
     def _probe() -> Dict[str, Any]:
         opts = _probe_opts(allow_playlist=False, referer=probe_referer,

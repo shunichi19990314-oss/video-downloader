@@ -80,7 +80,19 @@ DEFAULT_USER_AGENT: str = (
 
 
 class ResolveError(Exception):
-    """解決に失敗したことを表す。message はそのままユーザーへ返す文言。"""
+    """
+    解決に失敗したことを表す。message はそのままユーザーへ返す文言。
+
+    definitive=True は「これ以上他の手段を試す意味がない」確定的な失敗
+    (例: ファイルが失効・削除されている)。
+    False は「リゾルバには見つからなかったが、yt-dlp 本体なら解析できるかも
+    しれない」ケース (例: iframe 埋め込み / 難読化JS)。
+    呼び出し側は False のとき yt-dlp へフォールバックできる。
+    """
+
+    def __init__(self, message: str, definitive: bool = False):
+        super().__init__(message)
+        self.definitive = definitive
 
 
 @dataclass
@@ -513,7 +525,8 @@ def resolve_streamhg(
     _progress(f"解析完了 ({time.time() - started:.1f}秒 / {len(tried)}ページ確認)")
 
     if gone_message:
-        raise ResolveError(gone_message)
+        # 「失効・削除済み」は確定的な答え。他ルートや yt-dlp を試す意味がない。
+        raise ResolveError(gone_message, definitive=True)
 
     if not candidates:
         raise ResolveError(
