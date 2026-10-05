@@ -191,7 +191,7 @@ if RESOLVER_EXTRA_HOSTS:
         resolvers.STREAMHG_HOSTS.add(f"www.{_h}")
 
 APP_START_TIME: float = time.time()
-APP_VERSION: str = "1.2.0"
+APP_VERSION: str = "1.2.1"
 
 
 # ===========================================================================

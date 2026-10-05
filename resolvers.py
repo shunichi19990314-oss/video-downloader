@@ -279,16 +279,30 @@ STREAMHG_HOSTS = {
 }
 
 # file_code は 12 文字前後の英数字 (例: tosva74t17xo, svdyfxg6p0up)
-_FILE_CODE_RE = re.compile(r"^[A-Za-z0-9]{6,32}$")
+# ただし実在のコードには "_" や "-" を含むものがある (例: tegkgvhzotw6_n)。
+_FILE_CODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{4,31}$")
+
+# 動画ページと誤認してはいけない「サイト側の固定ページ」。
+# file_code に "_" を許可すると make_money 等と衝突するため、明示的に除外する。
+_RESERVED_PATHS = {
+    "premium", "contact", "faq", "login", "register", "registration", "tos",
+    "api", "make_money", "checkfiles", "upload-data", "player", "images",
+    "hg", "hg1", "daly", "home", "index", "about", "dmca", "privacy",
+    "signup", "signin", "forgot_password", "settings", "account", "files",
+    "folder", "search", "static", "assets", "css", "js", "favicon",
+}
 
 # URL パターン:
 #   /e/<code>[.html]  埋め込みプレイヤー  ← これが本命
 #   /d/<code>         ダウンロードページ
 #   /f/<code>         ファイルページ
 #   /<code>[.html]    視聴ページ
+# /e/ /d/ /f/ の各ルートは動画専用なので code に予約語チェックは不要。
+# 一方 /<code> 形式は固定ページ (/premium, /contact, /make_money.html …) と
+# 衝突するため、_RESERVED_PATHS で除外する。
 _STREAMHG_PATTERNS = [
-    re.compile(r"^/(?P<kind>e|d|f)/(?P<code>[A-Za-z0-9]+?)(?:\.html?)?/?$", re.I),
-    re.compile(r"^/(?P<code>[A-Za-z0-9]{6,32})(?:\.html?)?/?$", re.I),
+    (re.compile(r"^/(?P<kind>e|d|f)/(?P<code>[A-Za-z0-9_-]+?)(?:\.html?)?/?$", re.I), False),
+    (re.compile(r"^/(?P<code>[A-Za-z0-9][A-Za-z0-9_-]{4,31})(?:\.html?)?/?$", re.I), True),
 ]
 
 
@@ -313,13 +327,19 @@ def parse_streamhg_code(url: str) -> Optional[str]:
     if (parsed.hostname or "").lower() not in STREAMHG_HOSTS:
         return None
     path = parsed.path or "/"
-    for pattern in _STREAMHG_PATTERNS:
+    for pattern, check_reserved in _STREAMHG_PATTERNS:
         m = pattern.match(path)
         if not m:
             continue
         code = m.groupdict().get("code") or ""
-        if _FILE_CODE_RE.match(code):
-            return code
+        if not _FILE_CODE_RE.match(code):
+            continue
+        # 予約語 (サイト固定ページ) は動画コードではない
+        if check_reserved and code.lower().replace("-", "_") in _RESERVED_PATHS:
+            return None
+        if check_reserved and code.lower() in _RESERVED_PATHS:
+            return None
+        return code
     return None
 
 
@@ -347,11 +367,35 @@ def _reconstruct_netloc(parsed, default_host: str = "iplayerhls.com") -> str:
 
 
 def embed_url(url: str, code: str) -> str:
-    """file_code から埋め込みプレイヤー URL を組み立てる。"""
+    """file_code から埋め込みプレイヤー URL を組み立てる (後方互換用)。"""
+    return candidate_page_urls(url, code)[0]
+
+
+def candidate_page_urls(url: str, code: str) -> List[str]:
+    """
+    プレイヤーページとして試す URL の候補を、優先順位つきで返す。
+
+    ★ 重要: ドメインごとに「どのルートが生きているか」が異なる。
+      実測では iplayerhls.com の /f/<code> は 200 だが /e/<code> は 404 だった。
+      そのため /e/<code>.html 固定で正規化するのではなく、
+      「指定された URL をそのまま」最優先にし、駄目なら他形式へフォールバックする。
+    """
     parsed = urlparse(url)
     scheme = parsed.scheme if parsed.scheme in ("http", "https") else "https"
     netloc = _reconstruct_netloc(parsed)
-    return f"{scheme}://{netloc}/e/{code}.html"
+    base = f"{scheme}://{netloc}"
+
+    # 1) ユーザーが指定した URL そのまま (最も信頼できる)
+    original = url.split("#")[0]
+    candidates = [original]
+
+    # 2) 各ルートの .html 付き / 無し
+    for path in (f"/e/{code}.html", f"/e/{code}", f"/f/{code}", f"/d/{code}",
+                 f"/{code}.html", f"/{code}"):
+        full = base + path
+        if full not in candidates:
+            candidates.append(full)
+    return candidates
 
 
 def resolve_streamhg(
@@ -375,26 +419,47 @@ def resolve_streamhg(
     if not code:
         raise ResolveError("StreamHG 系の URL から file_code を解釈できませんでした。")
 
-    page = embed_url(url, code)
-    log.info("[resolver] streamhg: code=%s page=%s", code, page)
+    log.info("[resolver] streamhg: code=%s", code)
 
-    body_html = fetch_page(
-        page,
-        referer=url if url != page else None,
-        user_agent=user_agent,
-        validate_url=validate_url,
-    )[1]
+    # ドメインによって生きているルートが異なるため、候補を順に試す。
+    # 「失効ページ」が見つかったら、それは確定的な答えなので即座に返す。
+    candidates: List[Tuple[str, str]] = []
+    gone_message: Optional[str] = None
+    page = url
+    tried: List[str] = []
 
-    # --- 失効 / 削除 ---
-    gone = detect_gone(body_html)
-    if gone:
-        raise ResolveError(gone)
+    for page in candidate_page_urls(url, code):
+        tried.append(page)
+        try:
+            final_url, body_html = fetch_page(
+                page,
+                referer=url if url != page else None,
+                user_agent=user_agent,
+                validate_url=validate_url,
+            )
+        except ResolveError as exc:
+            log.info("[resolver] 候補 %s は取得不可 (%s)", page, str(exc)[:80])
+            continue
 
-    # --- メディア URL の抽出 ---
-    candidates = extract_media_urls(body_html)
+        gone = detect_gone(body_html)
+        if gone:
+            gone_message = gone
+            break   # 失効は確定的な情報。他ルートも試す意味がない
+
+        found = extract_media_urls(body_html)
+        if found:
+            candidates = found
+            page = final_url
+            break
+        log.info("[resolver] 候補 %s にメディアURLなし (次の形式を試す)", page)
+
+    if gone_message:
+        raise ResolveError(gone_message)
+
     if not candidates:
         raise ResolveError(
             "プレイヤーページから .m3u8 / .mp4 の URL を見つけられませんでした。\n"
+            f"(試した URL: {len(tried)} 形式)\n"
             "ページが難読化された JavaScript でマニフェストを組み立てている可能性があります。\n\n"
             "【対処法】ブラウザの DevTools (F12) → Network → 絞り込みに m3u8 と入力し、\n"
             "表示された .m3u8 の URL を本アプリの URL 欄に直接貼り付けてください。\n"

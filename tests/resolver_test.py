@@ -62,6 +62,7 @@ resolvers.STREAMHG_HOSTS.add("127.0.0.1")
 # StreamHG 風の模擬サーバ
 # ==========================================================================
 VALID = "validcode123"      # 正常に m3u8 が取れる
+FALLBACK = "fallbackcd1_x"  # /e/ は 404、/f/ だけ生きている (実サイトと同じ挙動)
 EXPIRED = "expiredcode1"    # 失効ページ
 OBFUSC = "obfuscated11"     # m3u8 が無い (難読化)
 SSRFID = "ssrfcode1234"     # 内部IPを指す m3u8 が仕込まれている
@@ -125,6 +126,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._send(200, SSRF_PAGE)
             if code == REDIRECT:
                 return self._send(302, "", extra={"Location": "http://127.0.0.1:1/steal"})
+            if code == FALLBACK:
+                # /e/ ルートは存在しない (404)。/f/ と /d/ だけがプレイヤーを返す。
+                if path.startswith("/e/"):
+                    return self._send(404, "<html><title>404 Not Found</title></html>")
+                media = f"http://127.0.0.1:{PORT}/hls/index.m3u8"
+                return self._send(200, PAGE_TMPL.format(title="Fallback Route Movie", media=media))
             return self._send(200, EXPIRED_PAGE)
 
         # 視聴ページ /<code>  (embed へ正規化されるはず)
@@ -136,7 +143,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path.startswith("/hls/"):
             ref = self.headers.get("Referer") or ""
             # 正体: /e/<code>.html からの Referer だけ許可する
-            if "/e/" in ref and VALID in ref:
+            same_origin = ref.startswith(f"http://127.0.0.1:{PORT}/")
+            if same_origin and (VALID in ref or FALLBACK in ref):
                 STATS["ok"] += 1
                 fpath = HLS_DIR / path.split("/hls/")[-1]
                 if fpath.is_file():
@@ -232,10 +240,40 @@ check("is_streamhg_url: 静的アセットは False",
       not resolvers.is_streamhg_url("https://iplayerhls.com/HG1/js/app.js"))
 check("is_streamhg_url: トップページは False",
       not resolvers.is_streamhg_url("https://iplayerhls.com/"))
-check("embed_url 正規化",
-      resolvers.embed_url("https://iplayerhls.com/tosva74t17xo", "tosva74t17xo")
-      == "https://iplayerhls.com/e/tosva74t17xo.html",
-      resolvers.embed_url("https://iplayerhls.com/tosva74t17xo", "tosva74t17xo"))
+# アンダースコア/ハイフンを含む実在形式の file_code
+for url, expect in [
+    ("https://iplayerhls.com/f/tegkgvhzotw6_n", "tegkgvhzotw6_n"),
+    ("https://iplayerhls.com/e/tegkgvhzotw6_n", "tegkgvhzotw6_n"),
+    ("https://iplayerhls.com/tegkgvhzotw6_n", "tegkgvhzotw6_n"),
+    ("https://iplayerhls.com/tegkgvhzotw6_n.html", "tegkgvhzotw6_n"),
+    ("https://iplayerhls.com/d/abc-def_123", "abc-def_123"),
+]:
+    check(f"解析 (記号入り) {url.split('.com')[-1]} -> {expect}",
+          resolvers.parse_streamhg_code(url) == expect, resolvers.parse_streamhg_code(url))
+
+# サイト固定ページを動画と誤認しないこと
+for url in ["https://iplayerhls.com/premium", "https://iplayerhls.com/contact",
+            "https://iplayerhls.com/make_money.html", "https://iplayerhls.com/login.html",
+            "https://iplayerhls.com/HG1/js/app.js", "https://iplayerhls.com/checkfiles.html",
+            "https://iplayerhls.com/api.html", "https://iplayerhls.com/faq"]:
+    check(f"固定ページを動画と誤認しない: {url.split('.com')[-1]}",
+          not resolvers.is_streamhg_url(url), resolvers.parse_streamhg_code(url))
+
+# 新仕様: 候補は「指定URLそのまま」を最優先にし、その後 各ルート形式へフォールバック
+_cands = resolvers.candidate_page_urls("https://iplayerhls.com/tosva74t17xo", "tosva74t17xo")
+check("候補1 = 指定URLそのまま (最優先)",
+      _cands[0] == "https://iplayerhls.com/tosva74t17xo", _cands[0])
+check("候補に /e/<code>.html を含む",
+      "https://iplayerhls.com/e/tosva74t17xo.html" in _cands, _cands)
+check("候補に /f/ /d/ 形式を含む",
+      any("/f/tosva74t17xo" in c for c in _cands) and any("/d/tosva74t17xo" in c for c in _cands), _cands)
+check("候補に重複がない", len(_cands) == len(set(_cands)), _cands)
+check("embed_url は先頭候補を返す (後方互換)", resolvers.embed_url(_cands[0], "tosva74t17xo") == _cands[0])
+# ポート付き URL でも候補が正しいこと
+_pc = resolvers.candidate_page_urls("http://127.0.0.1:8899/f/abc123def456", "abc123def456")
+check("ポート付きURLの候補が正しい",
+      _pc[0] == "http://127.0.0.1:8899/f/abc123def456"
+      and "http://127.0.0.1:8899/e/abc123def456.html" in _pc, _pc)
 
 # ==========================================================================
 print("\n--- 2) & 3) ページ解決 → ドメインロック付き HLS を取得 ---")
@@ -289,6 +327,24 @@ with TestClient(main.app) as client:
         check(f"形式 {form} でダウンロード成功", job["state"] == "finished",
               (job["state"], (job.get("error") or "")[:180]))
         clean()
+
+    # ------------------------------------------------------------------
+    print("\n--- 3-B) /e/ が 404 でも /f/ で解決できる (実サイト挙動) ---")
+    clean()
+    r = client.post("/api/download", json={"url": base(f"/f/{FALLBACK}")}, headers=H)
+    check("受付 202 (/f/<code>_x)", r.status_code == 202, r.text[:150])
+    job = wait_job(client, r.json()["job"]["id"])
+    check("★ /e/ が 404 でも /f/ から解決して finished", job["state"] == "finished",
+          (job["state"], (job.get("error") or "")[:200]))
+    check("タイトルが取得できている", bool(job.get("title")), job.get("title"))
+    clean()
+    # /e/<code> を指定しても、404 なら自動で /f/ へフォールバックする
+    r = client.post("/api/download", json={"url": base(f"/e/{FALLBACK}")}, headers=H)
+    if r.status_code == 202:
+        job = wait_job(client, r.json()["job"]["id"])
+        check("★ /e/ 指定でも他ルートへ自動フォールバック", job["state"] == "finished",
+              (job["state"], (job.get("error") or "")[:200]))
+    clean()
 
     # ------------------------------------------------------------------
     print("\n--- 4) 失効ページ → 分かりやすいエラー ---")
