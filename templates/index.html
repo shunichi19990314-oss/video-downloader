@@ -527,10 +527,14 @@ function renderJob(job) {
 
   // ---- 進捗バー ----
   const pctNum = Number(job.percent || 0);
-  if (job.state === "processing" && pctNum >= 100) {
-    // ffmpeg 処理中は確定パーセントが出ないため不定バーにする
+  // 不定バーにする条件:
+  //   (a) ffmpeg 後処理中 (取得は100%終わっているが変換中)
+  //   (b) まだ 0% だが稼働中 = URL解析中 / キュー待ち / 接続確立中
+  //       → 棒を動かして「固まっていない」ことを示す
+  const active = job.state === "queued" || job.state === "downloading";
+  if ((job.state === "processing" && pctNum >= 100) || (active && pctNum <= 0)) {
     el.bar.classList.add("indeterminate");
-    el.pct.textContent = "—";
+    el.pct.textContent = active && pctNum <= 0 ? "…" : "—";
   } else {
     el.bar.classList.remove("indeterminate");
     el.bar.style.width = `${Math.min(100, pctNum).toFixed(1)}%`;

@@ -48,6 +48,9 @@
                           (StreamHG / iPlayerHLS 等を .m3u8 へ解決)
     RESOLVER_EXTRA_HOSTS  リゾルバ対象に追加するホスト名 (カンマ区切り)
                           例) RESOLVER_EXTRA_HOSTS=streamhg.net,foo.example
+    RESOLVER_TIMEOUT      リゾルバの1ページ取得タイムアウト秒  (default: 12)
+    RESOLVER_TOTAL_BUDGET リゾルバ全体の時間予算(秒)          (default: 45)
+    RESOLVER_MAX_CANDIDATES 試す候補URL数の上限               (default: 6)
 
 ■ リクエスト単位のパラメータ (環境変数ではない)
     POST /api/download と POST /api/info は以下を受け付けます。
@@ -83,7 +86,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import unquote, urlparse
 
 import yt_dlp
@@ -191,7 +194,7 @@ if RESOLVER_EXTRA_HOSTS:
         resolvers.STREAMHG_HOSTS.add(f"www.{_h}")
 
 APP_START_TIME: float = time.time()
-APP_VERSION: str = "1.2.1"
+APP_VERSION: str = "1.2.2"
 
 
 # ===========================================================================
@@ -945,19 +948,81 @@ def _zip_playlist(job: Job, files: List[Path]) -> Path:
     return zip_path
 
 
+def _resolve_target(job: Job) -> Tuple[str, Optional[str]]:
+    """
+    フェーズ1: サイト固有リゾルバで「動画ページURL → 実メディアURL」へ解決する。
+
+    ★ この処理はネットワーク待ちで数秒〜数十秒かかるため、
+      同時実行セマフォの "外" で行う (中でやると枠を無駄に占有する)。
+    ★ 進捗は job.stage に書き、UI の「0% で無反応」を防ぐ。
+
+    戻り値: (yt-dlp に渡す URL, リゾルバが取ったタイトル or None)
+    """
+    if not ENABLE_SITE_RESOLVERS:
+        return job.url, None
+
+    try:
+        resolved = resolvers.resolve_if_supported(
+            job.url,
+            user_agent=job.user_agent,
+            validate_url=validate_url,
+            # 解析中の表示を UI へ流す (state は変えず stage だけ更新)
+            on_progress=lambda msg: job.set_stage(msg),
+        )
+    except (ResolveError, ValidationError) as exc:
+        raise ExtractionError(str(exc)) from exc
+
+    if resolved is None:
+        return job.url, None      # 対応外サイト → URL をそのまま yt-dlp へ
+
+    # ユーザーが Referer を明示していなければ、解決の過程で判明した
+    # プレイヤーページ URL を Referer にする (無いと .ts が 403 になる)。
+    if not job.referer and resolved.referer:
+        job.referer = validate_header_value(resolved.referer, "referer", 2048)
+    with job._lock:
+        job.resolver = resolved.resolver
+    if resolved.title:
+        job.set_meta({"title": resolved.title})
+    log.info("[job=%s] リゾルバ解決 %s -> %s (referer=%s)",
+             job.id, resolved.resolver, resolved.media_url[:110],
+             "set" if job.referer else "-")
+    return resolved.media_url, resolved.title
+
+
 def _run_download(job: Job) -> None:
     """
     ワーカースレッドで実行される本体。
     例外はすべて捕捉して job.fail() に落とし、プロセスを殺さない。
     """
-    # 同時実行数を絞る (Railway の RAM/CPU・帯域を守る)
+    preset = QUALITY_PRESETS.get(job.quality, QUALITY_PRESETS["best"])
+    log.info("[job=%s] 受付 url=%s quality=%s playlist=%s referer=%s",
+             job.id, job.url, job.quality, job.allow_playlist,
+             "set" if job.referer else "-")
+
+    # ------------------------------------------------------------------
+    # フェーズ1: URL 解決 (セマフォの外 / ネットワーク待ちで時間がかかるため)
+    # ------------------------------------------------------------------
+    job.set_stage("URL を解析中…")
+    try:
+        target_url, resolver_title = _resolve_target(job)
+    except ExtractionError as exc:
+        job.fail(str(exc))
+        log.warning("[job=%s] URL 解決に失敗: %s", job.id, str(exc)[:200])
+        _cleanup_partial(job.id)
+        return
+    except Exception as exc:  # noqa: BLE001
+        log.exception("[job=%s] URL 解決中に想定外のエラー", job.id)
+        job.fail(f"URL の解析に失敗しました: {exc.__class__.__name__}: {exc}")
+        _cleanup_partial(job.id)
+        return
+
+    # ------------------------------------------------------------------
+    # フェーズ2: ダウンロード (同時実行数を絞る: Railway の RAM/CPU・帯域を守る)
+    # ------------------------------------------------------------------
     with _download_semaphore:
         with JOBS_LOCK:
             job.state = JobState.DOWNLOADING
-        log.info("[job=%s] 開始 url=%s quality=%s playlist=%s referer=%s",
-                 job.id, job.url, job.quality, job.allow_playlist,
-                 "set" if job.referer else "-")
-        preset = QUALITY_PRESETS.get(job.quality, QUALITY_PRESETS["best"])
+        log.info("[job=%s] ダウンロード開始 target=%s", job.id, target_url[:110])
 
         try:
             # --- 開始前のディスク容量チェック --------------------------------
@@ -968,41 +1033,8 @@ def _run_download(job: Job) -> None:
                     "少し待ってから再試行してください。"
                 )
 
-            # --- サイト固有リゾルバ -----------------------------------------
-            # yt-dlp に専用 extractor が無いサイト (StreamHG / iPlayerHLS など) は、
-            # ここで「動画ページ URL → 実際の .m3u8 URL」へ解決しておく。
-            # 解決後は yt-dlp の generic extractor が HLS として確実に扱える。
-            target_url = job.url
-            resolver_title: Optional[str] = None
-            if ENABLE_SITE_RESOLVERS:
-                try:
-                    resolved = resolvers.resolve_if_supported(
-                        job.url,
-                        user_agent=job.user_agent,
-                        validate_url=validate_url,
-                    )
-                except (ResolveError, ValidationError) as exc:
-                    # ページ取得失敗 / ファイル失効 / m3u8 が見つからない など
-                    raise ExtractionError(str(exc)) from exc
-
-                if resolved is not None:
-                    target_url = resolved.media_url
-                    # ユーザーが Referer を明示していなければ、解決の過程で判明した
-                    # プレイヤーページ URL を Referer にする。
-                    # これが無いと .ts セグメントの取得が 403 になる。
-                    if not job.referer and resolved.referer:
-                        job.referer = validate_header_value(resolved.referer, "referer", 2048)
-                    with job._lock:
-                        job.resolver = resolved.resolver
-                    if resolved.title:
-                        resolver_title = resolved.title
-                        job.set_meta({"title": resolved.title})
-                    log.info("[job=%s] リゾルバ解決 %s -> %s (referer=%s)",
-                             job.id, resolved.resolver, target_url[:110],
-                             "set" if job.referer else "-")
-
-            # リゾルバによって Referer が決まる場合があるため、
-            # オプションの組み立てはこの後に行う。
+            # リゾルバによって target_url / Referer が確定しているので、
+            # ここで yt-dlp のオプションを組み立てる。
             opts = _build_ydl_opts(job, preset)
 
             # --- ダウンロード実行 -------------------------------------------

@@ -63,6 +63,11 @@ resolvers.STREAMHG_HOSTS.add("127.0.0.1")
 # ==========================================================================
 VALID = "validcode123"      # 正常に m3u8 が取れる
 FALLBACK = "fallbackcd1_x"  # /e/ は 404、/f/ だけ生きている (実サイトと同じ挙動)
+DUPCODE = "dupcode12345"    # /f/ と /d/ が同一内容、/<code> にだけプレイヤーがある
+SLOWCODE = "slowcode12345"  # ページ応答が遅い (タイムアウト/予算の検証用)
+NOMEDIA_PAGE = "<!DOCTYPE html><html><head><title>Download URKK-TEST.mp4</title></head>" \
+    "<body><div class='dl'>URKK-TEST.mp4</div>" \
+    "<script src='https://www.google.com/recaptcha/api.js'></script></body></html>"
 EXPIRED = "expiredcode1"    # 失効ページ
 OBFUSC = "obfuscated11"     # m3u8 が無い (難読化)
 SSRFID = "ssrfcode1234"     # 内部IPを指す m3u8 が仕込まれている
@@ -126,6 +131,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._send(200, SSRF_PAGE)
             if code == REDIRECT:
                 return self._send(302, "", extra={"Location": "http://127.0.0.1:1/steal"})
+            if code == DUPCODE:
+                # 実サイトの iplayerhls と同じ状況:
+                #   /f/ と /d/ = reCAPTCHA 付きDLページ (メディアURLなし・同一内容)
+                #   /e/        = 404
+                #   /<code>    = 視聴ページ (プレイヤーあり)
+                if path.startswith("/e/"):
+                    return self._send(404, "<html><title>404 Not Found</title></html>")
+                if path.startswith("/f/") or path.startswith("/d/"):
+                    return self._send(200, NOMEDIA_PAGE)
+                media = f"http://127.0.0.1:{PORT}/hls/index.m3u8"
+                return self._send(200, PAGE_TMPL.format(title="Watch Page Movie", media=media))
+            if code == SLOWCODE:
+                time.sleep(20)     # タイムアウト/予算切れを確実に発生させる
+                media = f"http://127.0.0.1:{PORT}/hls/index.m3u8"
+                return self._send(200, PAGE_TMPL.format(title="Slow", media=media))
             if code == FALLBACK:
                 # /e/ ルートは存在しない (404)。/f/ と /d/ だけがプレイヤーを返す。
                 if path.startswith("/e/"):
@@ -134,17 +154,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._send(200, PAGE_TMPL.format(title="Fallback Route Movie", media=media))
             return self._send(200, EXPIRED_PAGE)
 
-        # 視聴ページ /<code>  (embed へ正規化されるはず)
-        if path.strip("/").replace(".html", "") == VALID and path.count("/") <= 2:
+        # 視聴ページ /<code>  (ルート直下の bare 形式)
+        bare = path.strip("/").replace(".html", "")
+        if path.count("/") <= 2:
             media = f"http://127.0.0.1:{PORT}/hls/index.m3u8"
-            return self._send(200, PAGE_TMPL.format(title="Watch Page Title", media=media))
+            if bare == VALID:
+                return self._send(200, PAGE_TMPL.format(title="Watch Page Title", media=media))
+            if bare == DUPCODE:
+                return self._send(200, PAGE_TMPL.format(title="Watch Page Movie", media=media))
+            if bare == SLOWCODE:
+                time.sleep(20)
+                return self._send(200, PAGE_TMPL.format(title="Slow", media=media))
 
         # --- ドメインロックされた HLS ---
         if path.startswith("/hls/"):
             ref = self.headers.get("Referer") or ""
             # 正体: /e/<code>.html からの Referer だけ許可する
             same_origin = ref.startswith(f"http://127.0.0.1:{PORT}/")
-            if same_origin and (VALID in ref or FALLBACK in ref):
+            if same_origin and (VALID in ref or FALLBACK in ref or DUPCODE in ref):
                 STATS["ok"] += 1
                 fpath = HLS_DIR / path.split("/hls/")[-1]
                 if fpath.is_file():
@@ -512,6 +539,68 @@ check("strict_validate: file:// は拒否",
       _raises(lambda: strict_validate("file:///etc/passwd")))
 check("strict_validate: localhost m3u8 は拒否",
       _raises(lambda: strict_validate("http://127.0.0.1/x.m3u8")))
+
+# ==========================================================================
+print("\n--- 13) 解決中の進捗通知 (0% で無反応に見えないこと) ---")
+msgs = []
+res = resolvers.resolve_streamhg(
+    base(f"/f/{DUPCODE}"),
+    validate_url=None,
+    on_progress=lambda m: msgs.append(m),
+)
+check("DUPCODE: /f/ に無くても /<code> から解決できる", res.media_url.endswith("index.m3u8"),
+      res.media_url)
+check("★ on_progress が複数回呼ばれる", len(msgs) >= 2, msgs)
+check("★ 進捗に (n/m) の番号が付く", any("/" in m and "解析中" in m for m in msgs), msgs[:3])
+check("★ 同一内容ページをスキップした旨を通知",
+      any("同一内容" in m for m in msgs), msgs)
+check("解析完了の通知がある", any("解析完了" in m for m in msgs), msgs[-2:])
+check("Referer は m3u8 を見つけたページ", bool(res.referer) and DUPCODE in res.referer, res.referer)
+check("タイトルは視聴ページ由来", res.title == "Watch Page Movie", res.title)
+
+# API 経由でも stage が更新されること (UI が 0% 固定に見えない)
+print("\n--- 14) API 経由で stage が『解析中』に更新される ---")
+with TestClient(main.app) as client:
+    clean()
+    r = client.post("/api/download", json={"url": base(f"/f/{DUPCODE}")}, headers=H)
+    jid = r.json()["job"]["id"]
+    seen_stages = []
+    for _ in range(60):
+        j = client.get(f"/api/status/{jid}", headers=H).json()["job"]
+        seen_stages.append(j["stage"])
+        if j["state"] in ("finished", "error"):
+            break
+        time.sleep(0.05)
+    check("★ stage に『解析中』が表示された",
+          any("解析中" in (x or "") for x in seen_stages), seen_stages[:6])
+    check("最終的に finished", j["state"] == "finished", (j["state"], (j.get("error") or "")[:160]))
+    clean()
+
+# ==========================================================================
+print("\n--- 15) タイムアウトと時間予算 (無限に待たないこと) ---")
+orig_to, orig_budget = resolvers.FETCH_TIMEOUT, resolvers.RESOLVE_BUDGET
+try:
+    resolvers.FETCH_TIMEOUT = 2
+    resolvers.RESOLVE_BUDGET = 6
+    t0 = time.time()
+    try:
+        resolvers.resolve_streamhg(base(f"/f/{SLOWCODE}"))
+        check("低速ページは時間予算内で打ち切られる", False, "解決できてしまった")
+    except resolvers.ResolveError:
+        elapsed = time.time() - t0
+        check("★ 低速ページでも時間予算 (6s) 内に打ち切り", elapsed < 25, f"{elapsed:.1f}s")
+        check("打ち切りまでの時間が妥当 (>1s)", elapsed > 1.0, f"{elapsed:.1f}s")
+finally:
+    resolvers.FETCH_TIMEOUT, resolvers.RESOLVE_BUDGET = orig_to, orig_budget
+
+# MAX_CANDIDATES の上限が効くこと
+resolvers_saved = resolvers.MAX_CANDIDATES
+try:
+    resolvers.MAX_CANDIDATES = 2
+    got = resolvers.candidate_page_urls(base(f"/f/{DUPCODE}"), DUPCODE)[:resolvers.MAX_CANDIDATES]
+    check("MAX_CANDIDATES で候補数が制限される", len(got) == 2, got)
+finally:
+    resolvers.MAX_CANDIDATES = resolvers_saved
 
 srv.shutdown()
 

@@ -35,14 +35,16 @@ yt-dlp に専用 extractor が無いサイトについて、
 from __future__ import annotations
 
 import gzip
+import hashlib
 import html as html_lib
 import io
 import logging
 import re
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import urljoin, urlparse
 
 log = logging.getLogger("video-dl.resolver")
@@ -50,9 +52,26 @@ log = logging.getLogger("video-dl.resolver")
 # ---------------------------------------------------------------------------
 # 設定
 # ---------------------------------------------------------------------------
-FETCH_TIMEOUT: int = 25           # ページ取得のタイムアウト (秒)
+import os as _os
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = _os.getenv(name)
+    try:
+        return int(raw) if raw not in (None, "") else default
+    except ValueError:
+        return default
+
+
+# 1 ページ取得のタイムアウト (秒)。
+#   旧値 25 秒 × 候補 6 件 = 最悪 150 秒「0% で無反応」になるため短縮した。
+FETCH_TIMEOUT: int = max(3, _env_int("RESOLVER_TIMEOUT", 12))
+# 解決処理全体の予算 (秒)。これを超えたら残りの候補を試さずに打ち切る。
+RESOLVE_BUDGET: float = float(max(10, _env_int("RESOLVER_TOTAL_BUDGET", 45)))
+# 試す候補 URL の上限
+MAX_CANDIDATES: int = max(1, _env_int("RESOLVER_MAX_CANDIDATES", 6))
 MAX_PAGE_BYTES: int = 4 * 1024 * 1024   # 読むページサイズの上限 (4MB)
-MAX_REDIRECTS: int = 5
+MAX_REDIRECTS: int = 3
 
 DEFAULT_USER_AGENT: str = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -91,12 +110,15 @@ def fetch_page(
     referer: Optional[str] = None,
     user_agent: Optional[str] = None,
     validate_url: Optional[Callable[[str], str]] = None,
+    timeout: Optional[int] = None,
 ) -> Tuple[str, str]:
     """
     HTML ページを取得して (最終URL, 本文) を返す。
 
     validate_url を渡すと、リダイレクト先を都度検査する (SSRF 対策)。
+    timeout は残り予算に応じて呼び出し側から短縮できる。
     """
+    timeout = timeout or FETCH_TIMEOUT
     opener = urllib.request.build_opener(_NoRedirect)
     current = url
     for _ in range(MAX_REDIRECTS + 1):
@@ -110,7 +132,7 @@ def fetch_page(
             headers["Referer"] = referer
         req = urllib.request.Request(current, headers=headers)
         try:
-            with opener.open(req, timeout=FETCH_TIMEOUT) as resp:
+            with opener.open(req, timeout=timeout) as resp:
                 raw = resp.read(MAX_PAGE_BYTES + 1)
                 if resp.headers.get("Content-Encoding", "").lower() == "gzip":
                     try:
@@ -402,6 +424,7 @@ def resolve_streamhg(
     url: str,
     user_agent: Optional[str] = None,
     validate_url: Optional[Callable[[str], str]] = None,
+    on_progress: Optional[Callable[[str], None]] = None,
 ) -> ResolveResult:
     """
     StreamHG / iPlayerHLS の動画ページ URL を、実際の .m3u8 へ解決する。
@@ -421,25 +444,59 @@ def resolve_streamhg(
 
     log.info("[resolver] streamhg: code=%s", code)
 
+    def _progress(msg: str) -> None:
+        """進捗を呼び出し元 (UI) へ伝える。失敗しても解決処理は止めない。"""
+        log.info("[resolver] %s", msg)
+        if on_progress is None:
+            return
+        try:
+            on_progress(msg)
+        except Exception:
+            log.debug("on_progress の呼び出しに失敗 (無視)", exc_info=True)
+
     # ドメインによって生きているルートが異なるため、候補を順に試す。
     # 「失効ページ」が見つかったら、それは確定的な答えなので即座に返す。
     candidates: List[Tuple[str, str]] = []
     gone_message: Optional[str] = None
     page = url
     tried: List[str] = []
+    seen_digests: Set[str] = set()      # 同じ中身のページを二度解析しない
+    started = time.time()
 
-    for page in candidate_page_urls(url, code):
+    all_candidates = candidate_page_urls(url, code)[:MAX_CANDIDATES]
+    total = len(all_candidates)
+
+    for idx, page in enumerate(all_candidates, 1):
+        # --- 全体の時間予算 ---
+        elapsed = time.time() - started
+        remaining = RESOLVE_BUDGET - elapsed
+        if remaining <= 1:
+            log.warning("[resolver] 時間予算 (%.0fs) を使い切ったため打ち切り", RESOLVE_BUDGET)
+            break
+
         tried.append(page)
+        _progress(f"ページを解析中 ({idx}/{total})… {urlparse(page).path}")
+
         try:
             final_url, body_html = fetch_page(
                 page,
                 referer=url if url != page else None,
                 user_agent=user_agent,
                 validate_url=validate_url,
+                # 残り予算を超えないよう、1ページあたりのタイムアウトを切り詰める
+                timeout=int(min(FETCH_TIMEOUT, max(3, remaining))),
             )
         except ResolveError as exc:
             log.info("[resolver] 候補 %s は取得不可 (%s)", page, str(exc)[:80])
+            _progress(f"({idx}/{total}) 取得できませんでした — 次の形式を試します")
             continue
+
+        # --- 同じ中身のページは再解析しない (/f/ と /d/ が同一 など) ---
+        digest = hashlib.sha1(body_html.encode("utf-8", "ignore")).hexdigest()
+        if digest in seen_digests:
+            _progress(f"({idx}/{total}) 同一内容のためスキップ")
+            continue
+        seen_digests.add(digest)
 
         gone = detect_gone(body_html)
         if gone:
@@ -452,6 +509,8 @@ def resolve_streamhg(
             page = final_url
             break
         log.info("[resolver] 候補 %s にメディアURLなし (次の形式を試す)", page)
+
+    _progress(f"解析完了 ({time.time() - started:.1f}秒 / {len(tried)}ページ確認)")
 
     if gone_message:
         raise ResolveError(gone_message)
@@ -502,6 +561,7 @@ def resolve_if_supported(
     url: str,
     user_agent: Optional[str] = None,
     validate_url: Optional[Callable[[str], str]] = None,
+    on_progress: Optional[Callable[[str], None]] = None,
 ) -> Optional[ResolveResult]:
     """
     対応サイトなら解決結果を、対応外なら None を返す。
@@ -509,7 +569,8 @@ def resolve_if_supported(
     呼び出し側 (main.py) は None のとき URL をそのまま yt-dlp に渡す。
     """
     if is_streamhg_url(url):
-        return resolve_streamhg(url, user_agent=user_agent, validate_url=validate_url)
+        return resolve_streamhg(url, user_agent=user_agent, validate_url=validate_url,
+                                on_progress=on_progress)
     return None
 
 
