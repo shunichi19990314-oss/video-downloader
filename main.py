@@ -44,6 +44,10 @@
     AUDIO_CODEC           「音声のみ」の変換形式              (default: mp3)
     AUDIO_QUALITY         「音声のみ」のビットレート(kbps)     (default: 192)
     LOG_LEVEL             ログレベル                          (default: INFO)
+    ENABLE_SITE_RESOLVERS 1 でサイト固有リゾルバを有効化       (default: 1)
+                          (StreamHG / iPlayerHLS 等を .m3u8 へ解決)
+    RESOLVER_EXTRA_HOSTS  リゾルバ対象に追加するホスト名 (カンマ区切り)
+                          例) RESOLVER_EXTRA_HOSTS=streamhg.net,foo.example
 
 ■ リクエスト単位のパラメータ (環境変数ではない)
     POST /api/download と POST /api/info は以下を受け付けます。
@@ -83,6 +87,10 @@ from typing import Any, Dict, List, Optional, Set
 from urllib.parse import unquote, urlparse
 
 import yt_dlp
+
+import resolvers
+from resolvers import ResolveError
+
 from fastapi import (
     BackgroundTasks,
     Body,
@@ -166,8 +174,24 @@ ALLOW_PLAYLIST: bool = _env_flag("ALLOW_PLAYLIST", False)
 BLOCK_PRIVATE_HOSTS: bool = _env_flag("BLOCK_PRIVATE_HOSTS", True)
 COOKIES_FILE: str = _env_str("COOKIES_FILE", "").strip()
 
+# サイト固有リゾルバ (StreamHG / iPlayerHLS など、yt-dlp に extractor が無い
+# HLS ホストを .m3u8 へ解決する) を有効にするか。 1=有効(既定) / 0=無効
+ENABLE_SITE_RESOLVERS: bool = _env_flag("ENABLE_SITE_RESOLVERS", True)
+
+# リゾルバの対象に追加するホスト名 (カンマ区切り)。
+# StreamHG 系はミラードメインが多いため、コード変更せずに追加できるようにする。
+#   例) RESOLVER_EXTRA_HOSTS=streamhg.net,myhost.example
+RESOLVER_EXTRA_HOSTS: List[str] = [
+    h.strip().lower().removeprefix("www.")
+    for h in _env_str("RESOLVER_EXTRA_HOSTS", "").split(",") if h.strip()
+]
+if RESOLVER_EXTRA_HOSTS:
+    for _h in RESOLVER_EXTRA_HOSTS:
+        resolvers.STREAMHG_HOSTS.add(_h)
+        resolvers.STREAMHG_HOSTS.add(f"www.{_h}")
+
 APP_START_TIME: float = time.time()
-APP_VERSION: str = "1.1.0"
+APP_VERSION: str = "1.2.0"
 
 
 # ===========================================================================
@@ -369,6 +393,7 @@ class Job:
     # ドメインロックされたプレイヤー (StreamHG 等) 用のヘッダ透過
     referer: Optional[str] = None
     user_agent: Optional[str] = None
+    resolver: Optional[str] = None        # どのリゾルバが URL を解決したか
     created_at: float = field(default_factory=time.time)
 
     state: str = JobState.QUEUED
@@ -491,6 +516,7 @@ class Job:
                 "quality": self.quality,
                 "audio_only": self.audio_only,
                 "referer": self.referer,
+                "resolver": self.resolver,
                 "filename": self.filename,
                 "filesize": self.filesize,
                 "created_at": self.created_at,
@@ -942,6 +968,41 @@ def _run_download(job: Job) -> None:
                     "少し待ってから再試行してください。"
                 )
 
+            # --- サイト固有リゾルバ -----------------------------------------
+            # yt-dlp に専用 extractor が無いサイト (StreamHG / iPlayerHLS など) は、
+            # ここで「動画ページ URL → 実際の .m3u8 URL」へ解決しておく。
+            # 解決後は yt-dlp の generic extractor が HLS として確実に扱える。
+            target_url = job.url
+            resolver_title: Optional[str] = None
+            if ENABLE_SITE_RESOLVERS:
+                try:
+                    resolved = resolvers.resolve_if_supported(
+                        job.url,
+                        user_agent=job.user_agent,
+                        validate_url=validate_url,
+                    )
+                except (ResolveError, ValidationError) as exc:
+                    # ページ取得失敗 / ファイル失効 / m3u8 が見つからない など
+                    raise ExtractionError(str(exc)) from exc
+
+                if resolved is not None:
+                    target_url = resolved.media_url
+                    # ユーザーが Referer を明示していなければ、解決の過程で判明した
+                    # プレイヤーページ URL を Referer にする。
+                    # これが無いと .ts セグメントの取得が 403 になる。
+                    if not job.referer and resolved.referer:
+                        job.referer = validate_header_value(resolved.referer, "referer", 2048)
+                    with job._lock:
+                        job.resolver = resolved.resolver
+                    if resolved.title:
+                        resolver_title = resolved.title
+                        job.set_meta({"title": resolved.title})
+                    log.info("[job=%s] リゾルバ解決 %s -> %s (referer=%s)",
+                             job.id, resolved.resolver, target_url[:110],
+                             "set" if job.referer else "-")
+
+            # リゾルバによって Referer が決まる場合があるため、
+            # オプションの組み立てはこの後に行う。
             opts = _build_ydl_opts(job, preset)
 
             # --- ダウンロード実行 -------------------------------------------
@@ -952,8 +1013,15 @@ def _run_download(job: Job) -> None:
             #   返り値の info_dict に requested_downloads[*].filepath が入っており、
             #   ffmpeg マージ後の「最終的な出力パス」を推測なしで正確に知れるため。
             with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(job.url, download=True) or {}
+                info = ydl.extract_info(target_url, download=True) or {}
                 job.set_meta(info)          # タイトル等の確定値を反映
+                # リゾルバがページから取ったタイトルの方が有益な場合が多い。
+                # m3u8 を generic extractor で読むと "index" 等の味気ない名前になるため、
+                # 抽出元が generic (またはタイトル未取得) のときはリゾルバの値を優先する。
+                if resolver_title and (
+                    not info.get("title") or info.get("extractor_key") == "Generic"
+                ):
+                    job.set_meta({"title": resolver_title})
                 paths = _paths_from_info(info)
                 if not paths:
                     # requested_downloads が無い古い挙動への保険
@@ -1305,6 +1373,9 @@ async def lifespan(app: FastAPI):
 
     log.info("起動完了: 同時実行数=%d, file_ttl=%ds, playlist=%s, allow_extractors=%s",
              MAX_CONCURRENT, FILE_TTL_SECONDS, ALLOW_PLAYLIST, ALLOWED_EXTRACTORS or "ALL")
+    log.info("リゾルバ: enabled=%s 対象ホスト=%s",
+             ENABLE_SITE_RESOLVERS,
+             sorted(resolvers.STREAMHG_HOSTS) if ENABLE_SITE_RESOLVERS else "(無効)")
 
     try:
         yield
@@ -1358,6 +1429,8 @@ async def index(request: Request) -> HTMLResponse:
             ],
             "allow_playlist": ALLOW_PLAYLIST,
             "file_ttl": FILE_TTL_SECONDS,
+            "resolvers_enabled": ENABLE_SITE_RESOLVERS,
+            "resolver_sites": resolvers.describe_support() if ENABLE_SITE_RESOLVERS else {},
         },
     )
 
@@ -1399,6 +1472,9 @@ async def presets(_: str = Depends(require_auth)) -> Dict[str, Any]:
         "max_filesize_mb": MAX_FILESIZE_MB,
         "max_concurrent": MAX_CONCURRENT,
         "allowed_extractors": ALLOWED_EXTRACTORS,
+        "resolvers_enabled": ENABLE_SITE_RESOLVERS,
+        "resolver_sites": resolvers.describe_support() if ENABLE_SITE_RESOLVERS else {},
+        "resolver_extra_hosts": RESOLVER_EXTRA_HOSTS,
     }
 
 
@@ -1538,11 +1614,25 @@ async def probe_info(
     referer = validate_referer(payload.referer)
     user_agent = validate_header_value(payload.user_agent, "user_agent")
 
+    # サイト固有リゾルバが使えるなら、先に実メディア URL へ解決しておく
+    probe_url = url
+    probe_referer = referer
+    if ENABLE_SITE_RESOLVERS:
+        try:
+            resolved = resolvers.resolve_if_supported(
+                url, user_agent=user_agent, validate_url=validate_url)
+        except (ResolveError, ValidationError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if resolved is not None:
+            probe_url = resolved.media_url
+            probe_referer = probe_referer or resolved.referer
+
     def _probe() -> Dict[str, Any]:
-        opts = _probe_opts(allow_playlist=False, referer=referer, user_agent=user_agent)
+        opts = _probe_opts(allow_playlist=False, referer=probe_referer,
+                           user_agent=user_agent)
         opts["extract_flat"] = "in_playlist"   # プレイリストは中身を展開せず軽く確認
         with yt_dlp.YoutubeDL(opts) as ydl:
-            result = ydl.extract_info(url, download=False) or {}
+            result = ydl.extract_info(probe_url, download=False) or {}
         # ホワイトリスト設定時は、許可されていないサイトをここで弾く
         _assert_extractor_allowed(result)
         return result
@@ -1572,6 +1662,7 @@ async def probe_info(
     ]
 
     return {
+        "resolved_url": probe_url if probe_url != url else None,
         "title": info.get("title"),
         "uploader": info.get("uploader") or info.get("channel"),
         "duration": info.get("duration"),

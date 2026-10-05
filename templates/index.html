@@ -249,6 +249,17 @@
         http / https のみ許可。localhost や内部 IP へのアクセスはブロックされます。
         動画ページの URL のほか、<code>.m3u8</code> (HLS) 直リンクもそのまま指定できます。
       </p>
+      {% if resolvers_enabled and resolver_sites %}
+      <div class="alert info" style="margin-top:8px">
+        🔗 <strong>自動解決に対応:</strong>
+        {% for group, hosts in resolver_sites.items() %}<code>{{ hosts | join("</code> / <code>") }}</code>{% endfor %}
+        <br>
+        これらのサイトは<strong>動画ページの URL をそのまま貼るだけ</strong>で、
+        内部の <code>.m3u8</code> と必要な <code>Referer</code> を自動で解決します
+        (埋め込み <code>/e/&lt;ID&gt;</code> / 視聴ページ <code>/&lt;ID&gt;</code> /
+        <code>/d/</code> <code>/f/</code> の各形式に対応)。
+      </div>
+      {% endif %}
     </div>
 
     <div class="field">

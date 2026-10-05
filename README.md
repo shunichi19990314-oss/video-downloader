@@ -10,13 +10,16 @@ video-dl/
 ├── main.py               # FastAPI アプリ本体 (認証 / ジョブ管理 / 進捗 / 自動削除)
 ├── templates/
 │   └── index.html        # フロントエンド UI (依存 CDN なしのインライン CSS/JS)
+├── resolvers.py          # サイト固有リゾルバ (StreamHG / iPlayerHLS)
 ├── requirements.txt      # Python 依存
 ├── Dockerfile            # ffmpeg 込みの実行環境 (非 root / uvicorn 起動)
 ├── .dockerignore
 ├── .env.example          # 環境変数のサンプル
 └── tests/
     ├── smoke_test.py     # 認証・SSRF・進捗・自動削除・リーパー (79項目)
-    └── ffmpeg_test.py    # マージ・MP3・ZIP・許可リスト (68項目)
+    ├── ffmpeg_test.py    # マージ・MP3・ZIP・許可リスト (68項目)
+    ├── referer_test.py   # Referer 透過・ヘッダインジェクション防御 (35項目)
+    └── resolver_test.py  # StreamHG 系リゾルバ (模擬サーバで検証, 75項目)
 ```
 
 ---
@@ -32,6 +35,7 @@ video-dl/
 | **ストレージ自動最適化** | ① 送出完了直後に `BackgroundTask` で削除 ② TTL 超過分をリーパースレッドが削除 ③ 孤立ファイル/`.part` 残骸も回収 ④ シャットダウン時に全削除 |
 | **UI** | トークンは `localStorage` 保存、進捗バー、完了後の取得ボタン、履歴、エラー表示、設定の記憶 |
 | **エラー処理** | `DownloadError` / `ExtractorError` を捕捉し、英語メッセージを日本語に翻訳して返却 |
+| **サイト固有リゾルバ** | `iplayerhls.com` / `streamhg.com` の動画ページ URL を、内部の `.m3u8` + 必要な `Referer` へ自動変換 (`resolvers.py`)。失効ページは日本語で明確に通知 |
 | **Referer / UA 透過** | ドメインロックされたプレイヤー (StreamHG 等) 向け。m3u8 本体と全 `.ts` セグメントに自動付与。CRLF インジェクションは 400 で拒否 |
 | **セキュリティ** | スキーム許可制、内部 IP/localhost/クラウドメタデータ (169.254.169.254) への SSRF ブロック、UUID 検証によるパストラバーサル遮断、ファイル名サニタイズ、非 root 実行 |
 
@@ -184,7 +188,72 @@ python tests/ffmpeg_test.py            # マージ/MP3/ZIP/抽出元許可リス
 
 ---
 
-## 📡 ドメインロックされたプレイヤー / HLS 直リンク (StreamHG など)
+## 🔗 対応サイト: iPlayerHLS / StreamHG (自動解決)
+
+**`iplayerhls.com` と `streamhg.com` は、動画ページの URL を貼るだけでダウンロードできます。**
+
+これらのサイトは yt-dlp に専用 extractor がありませんが、本アプリが
+**リゾルバ層** (`resolvers.py`) で「動画ページ → 実際の `.m3u8`」を自動変換し、
+必要な `Referer` も自動で付与します。
+
+### 対応している URL 形式
+
+| 形式 | 例 |
+|---|---|
+| 埋め込みプレイヤー | `https://iplayerhls.com/e/<file_code>` |
+| 埋め込み (`.html` 付き) | `https://iplayerhls.com/e/<file_code>.html` |
+| 視聴ページ | `https://iplayerhls.com/<file_code>` / `.html` |
+| ダウンロードページ | `https://iplayerhls.com/d/<file_code>` |
+| ファイルページ | `https://iplayerhls.com/f/<file_code>` |
+| StreamHG 本体 | `https://streamhg.com/e/<file_code>` など同上 |
+
+対応ホスト: `iplayerhls.com` / `streamhg.com` / `vidshared.com` (`www.` 付きも可)
+
+### 仕組み
+
+```
+貼られた URL
+   ↓ ① file_code を抽出し /e/<code>.html (プレイヤーページ) へ正規化
+   ↓ ② ページを取得 (リダイレクトは都度 SSRF 再検査)
+   ↓ ③ 失効ページなら分かりやすいエラーに
+   ↓ ④ .m3u8 (無ければ .mp4) を優先順位つきパターンで抽出
+   ↓ ⑤ 抽出した URL を validate_url で再検査 (悪意あるページ対策)
+   ↓ ⑥ Referer にプレイヤーページ URL を自動設定
+yt-dlp (generic extractor) が HLS として取得 → ffmpeg で mp4 に多重化
+```
+
+**無効化**: `ENABLE_SITE_RESOLVERS=0`
+
+**ミラードメインの追加**: StreamHG 系はドメインが増えがちなので、コードを変更せずに
+環境変数で対象ホストを追加できます (`www.` は自動で付与されます)。
+
+```
+RESOLVER_EXTRA_HOSTS=newmirror.example,another.example
+```
+
+> 💡 起動ログに `リゾルバ: enabled=True 対象ホスト=[...]` と表示されるので、
+> 追加が反映されているか確認できます。
+
+### 調査で判明したこと (2026-10 時点)
+
+| 項目 | 内容 |
+|---|---|
+| `iplayerhls.com` の正体 | **StreamHG と同一プラットフォーム** (`<title>StreamHG</title>`、共通の `/HG1/` テーマ、`t.me/streamhgofficial` へのリンク、`xupload.js` = XFileShare 系) |
+| yt-dlp の対応 | **extractor 無し** (XFileShare 系は現行版から削除済み) |
+| `iplayerhls.com` の動画ページ | **HTTP 200 で取得可能** (ブロックなし) → リゾルバで解析できる |
+| `streamhg.com` の動画ページ | **全て 403 Forbidden** (nginx + Cloudflare) → 直接は解析不可 |
+| 公式 API | `streamhgapi.com/api/file/direct_link?key=<APIキー>&file_code=<ID>&hls=1` が `hls_direct` を返すが、**アカウント所有者の API キー必須** |
+| ファイルの寿命 | 無料アカウントの非アクティブファイルは **120 日で削除** → 「File is no longer available」ページになる |
+
+> **注意**: 公開リンクの多くは既に失効しています。ダウンロードに失敗したら、
+> まずリンクが生きているか (ブラウザで再生できるか) を確認してください。
+
+> ⚠️ 他者のコンテンツのダウンロードは、サイトの利用規約・著作権・居住国の法令に
+> 照らしてご自身の責任で行ってください。
+
+---
+
+## 📡 ドメインロックされたプレイヤー / HLS 直リンク (汎用)
 
 `yt-dlp` に専用 extractor が無い動画ホスティング (StreamHG, StreamWish 系の
 XFileShare ホストなど) でも、次の 2 つの方法で取得できる場合があります。
