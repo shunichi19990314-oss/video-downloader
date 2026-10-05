@@ -32,6 +32,7 @@ video-dl/
 | **ストレージ自動最適化** | ① 送出完了直後に `BackgroundTask` で削除 ② TTL 超過分をリーパースレッドが削除 ③ 孤立ファイル/`.part` 残骸も回収 ④ シャットダウン時に全削除 |
 | **UI** | トークンは `localStorage` 保存、進捗バー、完了後の取得ボタン、履歴、エラー表示、設定の記憶 |
 | **エラー処理** | `DownloadError` / `ExtractorError` を捕捉し、英語メッセージを日本語に翻訳して返却 |
+| **Referer / UA 透過** | ドメインロックされたプレイヤー (StreamHG 等) 向け。m3u8 本体と全 `.ts` セグメントに自動付与。CRLF インジェクションは 400 で拒否 |
 | **セキュリティ** | スキーム許可制、内部 IP/localhost/クラウドメタデータ (169.254.169.254) への SSRF ブロック、UUID 検証によるパストラバーサル遮断、ファイル名サニタイズ、非 root 実行 |
 
 ---
@@ -183,6 +184,62 @@ python tests/ffmpeg_test.py            # マージ/MP3/ZIP/抽出元許可リス
 
 ---
 
+## 📡 ドメインロックされたプレイヤー / HLS 直リンク (StreamHG など)
+
+`yt-dlp` に専用 extractor が無い動画ホスティング (StreamHG, StreamWish 系の
+XFileShare ホストなど) でも、次の 2 つの方法で取得できる場合があります。
+
+### 方法1: `.m3u8` 直リンクをそのまま貼る (推奨・追加設定なし)
+
+これらのホストは **HLS 配信** (`index.m3u8` + 多数の `.ts` セグメント) を使っています。
+本アプリは **m3u8 の直接指定に対応済み** で、ffmpeg が mp4 へ多重化します。
+
+1. 動画をブラウザで再生する
+2. **F12** (DevTools) → **Network** タブ → 絞り込み欄に `m3u8`
+3. 見つかった `....m3u8` の URL をコピー
+4. 本アプリの ② に貼り付けて **ダウンロード開始**
+
+> 検証済み: 4 セグメントの HLS を取得 → mp4 に多重化 → 送出 → 自動削除まで成功。
+
+### 方法2: `Referer` を指定する (403 Forbidden になるとき)
+
+StreamHG などはプレイヤーが **ドメインロック** されており、Referer が無いと
+m3u8 も `.ts` セグメントも **403** で拒否されます。
+
+UI の **「詳細設定 — Referer / User-Agent / 直接 m3u8 リンク」** を開き、
+**動画ページを表示していた URL** を Referer に入れてください。
+サーバ側で yt-dlp の `http_headers` に設定され、**マニフェストと全セグメントの
+リクエストに自動的に付与** されます。
+
+```bash
+curl -X POST https://<your-app>.up.railway.app/api/download \
+  -H "X-API-Key: $AUTH_TOKEN" -H "Content-Type: application/json" \
+  -d '{"url":"https://.../index.m3u8","referer":"https://<動画ページのURL>"}'
+```
+
+**セキュリティ**: `referer` / `user_agent` は改行 (`\r\n`) などの制御文字を含むと
+**400 で拒否** します (ヘッダインジェクション対策)。スキームも http/https のみ許可。
+
+### StreamHG (`streamhg.com`) についての調査結果
+
+| 項目 | 結果 |
+|---|---|
+| yt-dlp の専用 extractor | **無し** (XFileShare 系 extractor は現行版から削除済み) |
+| 動画ページ (`/e/<id>`, `/<id>`, `/f/<id>`, `/d/<id>`, `/v/<id>`) | **全て 403 Forbidden** (nginx + Cloudflare、ドメインロック) |
+| 公式 API | `https://streamhgapi.com/api/file/direct_link?key=<APIキー>&file_code=<ID>&hls=1` が `hls_direct` (m3u8) を返す。**全エンドポイントがアカウント所有者の API キー必須** = 自分のファイル専用 |
+| ToS | 「Hotlinking is not allowed」と明記 |
+
+→ **自分でアップロードした動画**なら公式 API 連携を追加実装できます
+(`STREAMHG_API_KEY` を使う方式。ご要望があれば対応します)。
+→ **他人がアップロードした動画**はページが 403 のため、上記「方法1 + 方法2」が
+現実的な手段です。専用の extractor を書くには **実在する動画 URL のサンプル** が
+必要です (それが無いと解析も動作確認もできません)。
+
+> ⚠️ 他者のコンテンツのダウンロードは、サイトの利用規約・著作権・居住国の法令に
+> 照らしてご自身の責任で行ってください。
+
+---
+
 ## 🔌 API リファレンス
 
 すべての `/api/*` (health 除く) に認証が必要です。
@@ -207,7 +264,13 @@ python tests/ffmpeg_test.py            # マージ/MP3/ZIP/抽出元許可リス
 { "url": "https://www.youtube.com/watch?v=...", "quality": "best", "playlist": false }
 ```
 
-`quality`: `best` / `1080` / `720` / `480` / `audio`(MP3)
+| フィールド | 必須 | 説明 |
+|---|---|---|
+| `url` | ● | 動画ページ URL / `.m3u8` 直リンク |
+| `quality` | | `best` / `1080` / `720` / `480` / `audio`(MP3) |
+| `playlist` | | `true` で再生リスト一括 (`ALLOW_PLAYLIST=1` 時のみ) |
+| `referer` | | ドメインロックされたプレイヤーが 403 のときに指定 |
+| `user_agent` | | User-Agent の上書き |
 
 ```bash
 curl -X POST https://<your-app>.up.railway.app/api/download \

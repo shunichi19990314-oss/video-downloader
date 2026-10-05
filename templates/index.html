@@ -124,6 +124,16 @@
       border-color:var(--accent);background:rgba(79,140,255,.15);color:#fff;
     }
     .chk{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--muted);cursor:pointer}
+    details.adv{margin:0 0 14px;border:1px solid var(--border);border-radius:10px;background:#0d1421}
+    details.adv > summary{
+      cursor:pointer;padding:10px 13px;font-size:12.5px;color:var(--muted);
+      list-style:none;user-select:none;
+    }
+    details.adv > summary::-webkit-details-marker{display:none}
+    details.adv > summary::before{content:"▸ ";color:var(--accent)}
+    details.adv[open] > summary::before{content:"▾ "}
+    details.adv > summary:hover{color:var(--text)}
+    details.adv .adv-body{padding:0 13px 13px;border-top:1px solid var(--border)}
     .chk input{width:16px;height:16px;accent-color:var(--accent)}
 
     /* ---------- 進捗 ---------- */
@@ -235,7 +245,10 @@
                placeholder="https://www.youtube.com/watch?v=...">
         <button type="button" class="small ghost" id="pasteBtn" title="クリップボードから貼り付け">📋 貼付</button>
       </div>
-      <p class="hint">http / https のみ許可。localhost や内部 IP へのアクセスはブロックされます。</p>
+      <p class="hint">
+        http / https のみ許可。localhost や内部 IP へのアクセスはブロックされます。
+        動画ページの URL のほか、<code>.m3u8</code> (HLS) 直リンクもそのまま指定できます。
+      </p>
     </div>
 
     <div class="field">
@@ -259,6 +272,34 @@
       </label>
     </div>
     {% endif %}
+
+    <!-- 詳細設定: ドメインロックされたプレイヤー (StreamHG 等) 向け -->
+    <details class="adv" id="advBox">
+      <summary>詳細設定 — Referer / User-Agent / 直接 m3u8 リンク</summary>
+      <div class="adv-body">
+        <div class="field" style="margin-top:12px">
+          <label for="referer">Referer <span style="opacity:.6">(任意)</span></label>
+          <input id="referer" type="text" autocomplete="off" spellcheck="false"
+                 placeholder="https://example.com/embed/xxxx">
+          <p class="hint">
+            埋め込みプレイヤーが <strong>ドメインロック</strong>されていると、動画本体や
+            <code>.m3u8</code>・<code>.ts</code> へのアクセスが <strong>403</strong> で拒否されます。
+            その場合は「動画ページを表示していた URL」をここに入れると、
+            マニフェストと全セグメントに Referer が付与されて取得できます。
+          </p>
+        </div>
+        <div class="field">
+          <label for="userAgent">User-Agent <span style="opacity:.6">(任意 / 空で既定値)</span></label>
+          <input id="userAgent" type="text" autocomplete="off" spellcheck="false"
+                 placeholder="Mozilla/5.0 (Windows NT 10.0; Win64; x64) ...">
+        </div>
+        <p class="hint" style="margin:0">
+          💡 <strong>直接 m3u8 リンクにも対応しています。</strong>
+          ブラウザの DevTools (F12) → Network → 絞り込み欄に <code>m3u8</code> と入力して
+          見つかった URL をそのまま ② に貼るだけでも取得できます (ffmpeg が mp4 に多重化します)。
+        </p>
+      </div>
+    </details>
 
     <button type="button" class="primary" id="startBtn">⬇ ダウンロード開始</button>
     <div id="formAlert"></div>
@@ -327,6 +368,8 @@ const LS_TOKEN    = "vdl_token";
 const LS_QUALITY  = "vdl_quality";
 const LS_PLAYLIST = "vdl_playlist";
 const LS_REMEMBER = "vdl_remember";
+const LS_REFERER  = "vdl_referer";
+const LS_UA       = "vdl_useragent";
 
 const POLL_INTERVAL_MS = 1000;   // 進捗ポーリング間隔
 const MAX_HISTORY_ROWS = 25;
@@ -336,6 +379,7 @@ const $ = (id) => document.getElementById(id);
 const el = {
   token: $("token"), remember: $("remember"), toggleToken: $("toggleToken"), testToken: $("testToken"),
   url: $("url"), pasteBtn: $("pasteBtn"), startBtn: $("startBtn"),
+  referer: $("referer"), userAgent: $("userAgent"), advBox: $("advBox"),
   playlist: $("playlist"), qualitySeg: $("qualitySeg"),
   formAlert: $("formAlert"), jobAlert: $("jobAlert"),
   progressCard: $("progressCard"), bar: $("bar"), pct: $("pct"), stage: $("stage"),
@@ -483,6 +527,10 @@ function renderJob(job) {
   }
 
   el.stage.textContent = job.stage || "…";
+  if (job.referer) {
+    el.jobChannel.textContent =
+      (el.jobChannel.textContent ? el.jobChannel.textContent + " / " : "") + "Referer 送信中";
+  }
   el.statSpeed.textContent = job.speed ? `⚡ ${job.speed}` : "";
   el.statEta.textContent   = job.eta   ? `⏱ 残り ${job.eta}` : "";
   el.statSize.textContent  = job.filesize ? `💾 ${fmtBytes(job.filesize)}` : "";
@@ -650,6 +698,16 @@ async function startDownload() {
   try {
     const payload = { url, quality: selectedQuality() };
     if (el.playlist) payload.playlist = el.playlist.checked;
+
+    // Referer / User-Agent (任意)。ドメインロックされたプレイヤー向け。
+    const referer = (el.referer.value || "").trim();
+    const ua      = (el.userAgent.value || "").trim();
+    if (referer) payload.referer = referer;
+    if (ua)      payload.user_agent = ua;
+    try {
+      localStorage.setItem(LS_REFERER, referer);
+      localStorage.setItem(LS_UA, ua);
+    } catch (_) {}
     const data = await api("/api/download", { method: "POST", body: payload });
     const job = data.job;
     currentJobId = job.id;
@@ -754,6 +812,10 @@ function initPrefs() {
     }
     const playlist = localStorage.getItem(LS_PLAYLIST);
     if (el.playlist && playlist !== null) el.playlist.checked = playlist === "1";
+    const ref = localStorage.getItem(LS_REFERER);
+    if (ref) el.referer.value = ref;
+    const ua = localStorage.getItem(LS_UA);
+    if (ua) el.userAgent.value = ua;
   } catch (_) {}
 }
 
@@ -793,6 +855,12 @@ function bindEvents() {
   });
   el.token.addEventListener("keydown", (e) => {
     if (e.key === "Enter") { e.preventDefault(); el.url.focus(); }
+  });
+  // 詳細設定欄でも Enter で開始できるようにする
+  [el.referer, el.userAgent].forEach((input) => {
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); startDownload(); }
+    });
   });
 
   // 品質・プレイリスト選択を記憶

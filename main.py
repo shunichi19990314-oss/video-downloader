@@ -17,6 +17,8 @@
        - ファイル送出直後の BackgroundTask 削除
        - TTL 超過ジョブ / 孤立ファイル / .part を掃除するリーパー
     5. SSRF・パストラバーサル対策の URL / ファイル名バリデーション
+    6. Referer / User-Agent の透過 (ドメインロックされたプレイヤー対策)
+       → リクエストごとに指定可能。m3u8 本体だけでなく全 .ts セグメントにも適用
 
 ■ 環境変数
   【必須】
@@ -42,6 +44,16 @@
     AUDIO_CODEC           「音声のみ」の変換形式              (default: mp3)
     AUDIO_QUALITY         「音声のみ」のビットレート(kbps)     (default: 192)
     LOG_LEVEL             ログレベル                          (default: INFO)
+
+■ リクエスト単位のパラメータ (環境変数ではない)
+    POST /api/download と POST /api/info は以下を受け付けます。
+      url          必須。動画ページ URL / 直接の .m3u8 (HLS) URL
+      quality      best / 1080 / 720 / 480 / audio
+      playlist     true で再生リスト一括 (ALLOW_PLAYLIST=1 のときのみ有効)
+      referer      任意。ドメインロックされたプレイヤーが 403 を返す場合に、
+                   動画ページを表示していた URL を指定する。
+                   CRLF・制御文字・http(s) 以外のスキームは 400 で拒否。
+      user_agent   任意。User-Agent ヘッダの上書き (同上の検証あり)
 ============================================================================
 """
 
@@ -155,7 +167,7 @@ BLOCK_PRIVATE_HOSTS: bool = _env_flag("BLOCK_PRIVATE_HOSTS", True)
 COOKIES_FILE: str = _env_str("COOKIES_FILE", "").strip()
 
 APP_START_TIME: float = time.time()
-APP_VERSION: str = "1.0.0"
+APP_VERSION: str = "1.1.0"
 
 
 # ===========================================================================
@@ -264,6 +276,49 @@ def validate_url(raw_url: str) -> str:
     return url
 
 
+# HTTP ヘッダ値に含めてはいけない文字 (改行 = ヘッダインジェクション)
+_HEADER_UNSAFE_RE = re.compile(r"[\r\n\x00-\x1f\x7f]")
+
+
+def validate_header_value(value: Optional[str], field_name: str,
+                          max_len: int = 512) -> Optional[str]:
+    """
+    HTTP ヘッダ値として安全かどうかを検証する。
+
+    改行 (\r\n) を混ぜると「ヘッダインジェクション」で任意ヘッダを
+    追加できてしまうため、制御文字を一切許さない。
+    """
+    if value is None:
+        return None
+    v = value.strip()
+    if not v:
+        return None
+    if len(v) > max_len:
+        raise ValidationError(f"{field_name} が長すぎます ({max_len} 文字以内)。")
+    if _HEADER_UNSAFE_RE.search(v):
+        raise ValidationError(f"{field_name} に改行や制御文字を含めることはできません。")
+    return v
+
+
+def validate_referer(value: Optional[str]) -> Optional[str]:
+    """
+    Referer ヘッダの検証。http(s) の URL 形式のみ許可する。
+
+    ※ Referer は「送信先 URL に添えるヘッダ」であって新たなリクエスト先では
+      ないため、validate_url のプライベートIPブロックは適用しない
+      (適用すると legit なサイト内 Referer を弾いてしまう)。
+    """
+    v = validate_header_value(value, "referer", max_len=2048)
+    if v is None:
+        return None
+    parsed = urlparse(v)
+    if parsed.scheme.lower() not in ("http", "https"):
+        raise ValidationError("referer は http:// または https:// で始まる URL を指定してください。")
+    if not parsed.hostname:
+        raise ValidationError("referer にホスト名が含まれていません。")
+    return v
+
+
 def safe_filename(name: Optional[str], fallback: str = "download") -> str:
     """
     レスポンス用のファイル名をサニタイズする。
@@ -311,6 +366,9 @@ class Job:
     quality: str
     audio_only: bool
     allow_playlist: bool
+    # ドメインロックされたプレイヤー (StreamHG 等) 用のヘッダ透過
+    referer: Optional[str] = None
+    user_agent: Optional[str] = None
     created_at: float = field(default_factory=time.time)
 
     state: str = JobState.QUEUED
@@ -432,6 +490,7 @@ class Job:
                 "entries_total": self.entries_total,
                 "quality": self.quality,
                 "audio_only": self.audio_only,
+                "referer": self.referer,
                 "filename": self.filename,
                 "filesize": self.filesize,
                 "created_at": self.created_at,
@@ -528,7 +587,8 @@ QUALITY_PRESETS: Dict[str, Dict[str, Any]] = {
 }
 
 
-def _probe_opts(allow_playlist: bool = False) -> Dict[str, Any]:
+def _probe_opts(allow_playlist: bool = False, referer: Optional[str] = None,
+                user_agent: Optional[str] = None) -> Dict[str, Any]:
     """メタ情報だけを取得するための軽量オプション。"""
     opts: Dict[str, Any] = {
         "quiet": True,
@@ -544,6 +604,13 @@ def _probe_opts(allow_playlist: bool = False) -> Dict[str, Any]:
         opts["cookiefile"] = COOKIES_FILE
     if ALLOWED_EXTRACTOR_REGEXES:
         opts["allowed_extractors"] = list(ALLOWED_EXTRACTOR_REGEXES)
+    headers: Dict[str, str] = {}
+    if referer:
+        headers["Referer"] = referer
+    if user_agent:
+        headers["User-Agent"] = user_agent
+    if headers:
+        opts["http_headers"] = headers
     return opts
 
 
@@ -810,6 +877,19 @@ def _build_ydl_opts(job: Job, preset: Dict[str, Any]) -> Dict[str, Any]:
         ]
         opts["merge_output_format"] = None
 
+    # --- Referer / User-Agent の透過 -------------------------------------
+    # StreamHG などの「ドメインロックされたプレイヤー」は、正しい Referer が
+    # 無いと m3u8 やセグメント (.ts) へのアクセスを 403 で拒否します。
+    # yt-dlp の http_headers は 本体・マニフェスト・全セグメントのリクエストに
+    # 適用されるため、ここで一度設定すれば HLS 全体に効きます。
+    custom_headers: Dict[str, str] = {}
+    if job.referer:
+        custom_headers["Referer"] = job.referer
+    if job.user_agent:
+        custom_headers["User-Agent"] = job.user_agent
+    if custom_headers:
+        opts["http_headers"] = custom_headers
+
     # 抽出元ホワイトリスト (yt-dlp 純正オプション / 正規表現リスト)
     # 許可されていないサイトの URL は "Unsupported URL" として即座に弾かれ、
     # ダウンロード自体が始まらない = 帯域・ストレージの無駄が発生しない。
@@ -848,8 +928,9 @@ def _run_download(job: Job) -> None:
     with _download_semaphore:
         with JOBS_LOCK:
             job.state = JobState.DOWNLOADING
-        log.info("[job=%s] 開始 url=%s quality=%s playlist=%s",
-                 job.id, job.url, job.quality, job.allow_playlist)
+        log.info("[job=%s] 開始 url=%s quality=%s playlist=%s referer=%s",
+                 job.id, job.url, job.quality, job.allow_playlist,
+                 "set" if job.referer else "-")
         preset = QUALITY_PRESETS.get(job.quality, QUALITY_PRESETS["best"])
 
         try:
@@ -1151,6 +1232,12 @@ class DownloadRequest(BaseModel):
     url: str = Field(..., description="ダウンロード対象の URL", min_length=1, max_length=2048)
     quality: str = Field("best", description="best / 1080 / 720 / 480 / audio")
     playlist: bool = Field(False, description="再生リスト全体を取得するか")
+    referer: Optional[str] = Field(
+        None, max_length=2048,
+        description="Referer ヘッダ。ドメインロックされたプレイヤー (StreamHG 等) の "
+                    "m3u8 が 403 になる場合に、元ページの URL を指定する")
+    user_agent: Optional[str] = Field(
+        None, max_length=512, description="User-Agent ヘッダの上書き (任意)")
 
     def normalized_quality(self) -> str:
         q = (self.quality or "best").strip().lower()
@@ -1161,6 +1248,8 @@ class InfoRequest(BaseModel):
     """POST /api/info のボディ (URL のメタ情報だけ確認する)。"""
 
     url: str = Field(..., min_length=1, max_length=2048)
+    referer: Optional[str] = Field(None, max_length=2048)
+    user_agent: Optional[str] = Field(None, max_length=512)
 
 
 # ===========================================================================
@@ -1346,12 +1435,18 @@ async def create_download(
     if _executor is None:  # 通常は起きない (lifespan 未通過)
         raise HTTPException(status_code=503, detail="サーバがまだ初期化中です。少し待って再試行してください。")
 
+    # Referer / User-Agent はヘッダインジェクション対策の検証を通す
+    referer = validate_referer(payload.referer)
+    user_agent = validate_header_value(payload.user_agent, "user_agent")
+
     job = Job(
         id=str(uuid.uuid4()),
         url=url,
         quality=payload.normalized_quality(),
         audio_only=(payload.normalized_quality() == "audio"),
         allow_playlist=allow_playlist,
+        referer=referer,
+        user_agent=user_agent,
     )
     _register(job)
     _executor.submit(_run_download, job)
@@ -1440,8 +1535,11 @@ async def probe_info(
     """
     url = validate_url(payload.url)
 
+    referer = validate_referer(payload.referer)
+    user_agent = validate_header_value(payload.user_agent, "user_agent")
+
     def _probe() -> Dict[str, Any]:
-        opts = _probe_opts(allow_playlist=False)
+        opts = _probe_opts(allow_playlist=False, referer=referer, user_agent=user_agent)
         opts["extract_flat"] = "in_playlist"   # プレイリストは中身を展開せず軽く確認
         with yt_dlp.YoutubeDL(opts) as ydl:
             result = ydl.extract_info(url, download=False) or {}
